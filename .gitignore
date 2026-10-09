@@ -10,3 +10,9 @@ icons/
 shellext/target/
 __pycache__/
 *.pyc
+
+# installer build output
+build/
+dist/
+installer/target/
+installer/payload.zip

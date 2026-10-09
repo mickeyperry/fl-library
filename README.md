@@ -34,35 +34,49 @@ list. It never moves or changes your project files.
 - Windows 10 or 11, 64-bit.
 - [Everything](https://www.voidtools.com/) with **Tools → Options → HTTP Server** enabled. The
   default port is 8666; change it in `config.json`.
-- Python 3.10+ with tkinter (the standard python.org installer), used by the scanner and the menu
-  actions.
-- Rust (stable, MSVC toolchain), to build the panel and the Explorer extension.
-- Pillow (`pip install pillow`), to generate the icons.
+- Nothing else to run the installer: it bundles its own Python. Building from source needs
+  Python 3.10+ and Rust.
 
 ## Install
+
+1. Install [Everything](https://www.voidtools.com/) and turn on **Tools → Options → HTTP Server**
+   (port 8666).
+2. Run **`FL-Library-Setup.exe`** (from Releases, or build it yourself: see below).
+
+The setup shows whether Everything is reachable and which FL Studio versions it found, then
+installs to `C:\Program Files\FL Library`. Nothing else is needed: Python is bundled. It does the
+following:
+
+- registers the Explorer columns and the right-click menu
+- starts the panel and, if you choose, adds it to Windows startup
+- adds a scheduled task that re-indexes every 30 minutes (only new or changed files are parsed)
+
+Your library (index, tags, notes, bookmarks) lives in `%LOCALAPPDATA%\FL Library`.
+
+To uninstall, use Windows **Settings → Apps → FL Library**. Removing your library as well is
+optional.
+
+### Build the installer
+
+Needs Python 3.10+ (with Pillow: `pip install pillow`) and Rust (stable, MSVC toolchain).
 
 ```powershell
 git clone https://github.com/<you>/fl-library
 cd fl-library
-copy config.example.json config.json      # edit if your Everything port differs
-pip install pillow
-python make_icons.py
-cd shellext; cargo build --release; cd ..
-python scanner.py                         # first full index; can take a while on big drives
-# from an *elevated, 64-bit* PowerShell:
-powershell -ExecutionPolicy Bypass -File install.ps1
+python tools/build_installer.py        # -> dist\FL-Library-Setup.exe
 ```
 
-The installer does the following:
+The build script builds the panel and the Explorer extension, generates the icons, downloads the
+official embeddable Python from python.org (cached in `build\`), and packs everything into one exe.
 
-- registers the Explorer columns and the right-click menu
-- starts the panel and adds it to Windows startup
-- adds a scheduled task that re-indexes every 30 minutes (only new or changed files are parsed)
-
-To remove everything (your `library.db` is kept):
+### Developer install (run from the checkout)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File uninstall.ps1
+copy config.example.json config.json
+python make_icons.py
+cd shellext; cargo build --release; cd ..
+# from an elevated, 64-bit PowerShell:
+powershell -ExecutionPolicy Bypass -File install.ps1     # uninstall.ps1 to remove
 ```
 
 ## Settings (`config.json`)

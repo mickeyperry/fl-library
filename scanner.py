@@ -18,8 +18,15 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolE
 import flparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, 'library.db')
-CONFIG_PATH = os.path.join(HERE, 'config.json')
+# Installed by FL-Library-Setup.exe (Program Files is read-only for normal programs): keep data
+# in %LOCALAPPDATA%\FL Library. Running from a git checkout: keep it next to the scripts.
+if os.path.exists(os.path.join(HERE, 'installed.flag')):
+    DATA_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'FL Library')
+    os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    DATA_DIR = HERE
+DB_PATH = os.path.join(DATA_DIR, 'library.db')
+CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
 
 DEFAULT_CONFIG = {
     'everything_url': 'http://127.0.0.1:8666/',
