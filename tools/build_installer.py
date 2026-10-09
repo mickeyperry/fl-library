@@ -20,9 +20,24 @@ PY_URL = f'https://www.python.org/ftp/python/{PY_VERSION}/python-{PY_VERSION}-em
 APP_FILES = ['flparse.py', 'scanner.py', 'flctl.py']
 
 
+def clean_env():
+    """Rust bakes source paths into binaries; map the builder's home and checkout to neutral names
+    so a published exe does not carry your Windows user name."""
+    env = dict(os.environ)
+    home = os.path.expanduser('~')
+    flags = ['-C', 'target-feature=+crt-static',
+             f'--remap-path-prefix={home}=~',
+             f'--remap-path-prefix={ROOT}=fl-library']
+    cargo_home = os.environ.get('CARGO_HOME')
+    if cargo_home:
+        flags.append(f'--remap-path-prefix={cargo_home}=cargo')
+    env['RUSTFLAGS'] = ' '.join(flags)
+    return env
+
+
 def run(cmd, cwd):
     print('>', ' '.join(cmd), flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True)
+    subprocess.run(cmd, cwd=cwd, check=True, env=clean_env())
 
 
 def embedded_python():
@@ -72,6 +87,12 @@ def main():
     out = os.path.join(ROOT, 'dist', 'FL-Library-Setup.exe')
     shutil.copy(os.path.join(ROOT, 'installer', 'target', 'release', 'FL-Library-Setup.exe'), out)
     print('built', out, f'({os.path.getsize(out) / 1e6:.1f} MB)')
+    # refuse to hand out a binary that still names the builder
+    user = os.path.basename(os.path.expanduser('~')).lower().encode()
+    data = open(out, 'rb').read().lower()
+    if user and (user in data or user.decode().encode('utf-16-le') in data):
+        sys.exit(f'!! {out} still contains the user name "{user.decode()}": do not publish it')
+    print('privacy check: no user name inside')
 
 
 if __name__ == '__main__':
