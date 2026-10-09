@@ -350,6 +350,10 @@ struct Progress(isize);
 
 impl Progress {
     fn send(&self, pct: f32, status: &str, detail: &str) {
+        log(&format!("{:>3.0}% {status} {detail}", pct * 100.0));
+        if self.0 == 0 {
+            return; // silent mode: no window to update
+        }
         let msg = Box::into_raw(Box::new((status.to_string(), detail.to_string())));
         unsafe {
             if PostMessageW(HWND(self.0 as *mut c_void), WM_PROGRESS, WPARAM((pct * 1000.0) as usize), LPARAM(msg as isize)).is_err() {
@@ -358,6 +362,7 @@ impl Progress {
         }
     }
     fn fail(&self, err: String) {
+        log(&format!("FAILED: {err}"));
         let msg = Box::into_raw(Box::new(("!".to_string(), err)));
         unsafe {
             if PostMessageW(HWND(self.0 as *mut c_void), WM_PROGRESS, WPARAM(usize::MAX), LPARAM(msg as isize)).is_err() {
@@ -389,7 +394,15 @@ fn start_unelevated(exe: &Path) {
     let _ = Command::new("explorer.exe").arg(exe).spawn();
 }
 
+/// The property-schema and shell calls are COM: the worker thread has to join COM first.
+fn com_init() {
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+    }
+}
+
 fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
+    com_init();
     let dir = install_dir();
     let app = dir.join("app");
     let pythonw = dir.join("python").join("pythonw.exe");
@@ -567,6 +580,7 @@ fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
 }
 
 fn uninstall(delete_library: bool, p: &Progress) -> std::result::Result<(), String> {
+    com_init();
     let dir = install_dir();
     let hklm = HKEY_LOCAL_MACHINE;
     p.send(0.1, "Stopping FL Library", "");
@@ -897,7 +911,14 @@ unsafe fn start_work(hwnd: HWND, app: &mut App) {
     let p = Progress(hwnd.0 as isize);
     play("kick");
     std::thread::spawn(move || {
-        let r = if uninstalling { uninstall(opts[0], &p) } else { install(opts, &p) };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if uninstalling { uninstall(opts[0], &p) } else { install(opts, &p) }
+        }))
+        .unwrap_or_else(|e| {
+            let what = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
+            Err(format!("internal error: {}", what.unwrap_or_else(|| "unknown".into())))
+        });
+        log(&format!("result: {r:?}"));
         if let Err(e) = r {
             p.fail(e);
         }
@@ -985,7 +1006,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let msg = Box::from_raw(lp.0 as *mut (String, String));
             if wp.0 == usize::MAX {
                 app.page = Page::Failed;
-                app.error = msg.1;
+                app.error = format!("{}\n\nA log of every step is in {}", msg.1, log_path().display());
             } else {
                 app.progress = wp.0 as f32 / 1000.0;
                 app.status = msg.0;
@@ -1016,8 +1037,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+/// %TEMP%\FL-Library-Setup.log: every step and any crash, so a failed install can be diagnosed.
+fn log_path() -> PathBuf {
+    std::env::temp_dir().join("FL-Library-Setup.log")
+}
+
+fn log(line: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path()) {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = writeln!(f, "[{t}] {line}");
+    }
+}
+
 fn main() -> Result<()> {
     let uninstalling = std::env::args().any(|a| a.eq_ignore_ascii_case("/uninstall"));
+    let silent = std::env::args().any(|a| a.eq_ignore_ascii_case("/silent"));
+    let _ = std::fs::remove_file(log_path());
+    log(&format!("FL Library setup {VERSION} start: uninstall={uninstalling} silent={silent} os={}", std::env::consts::ARCH));
+    // never vanish silently: record the crash and tell the user where the log is
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("CRASH: {info}");
+        log(&msg);
+        let text = wide(&format!("FL Library setup hit a problem:\n\n{info}\n\nDetails were saved to:\n{}", log_path().display()));
+        unsafe {
+            MessageBoxW(None, PCWSTR(text.as_ptr()), w!("FL Library Setup"), MB_ICONERROR | MB_OK);
+        }
+    }));
+    if silent {
+        // unattended run (testing / deployment): no window, result in the log and the exit code
+        let p = Progress(0);
+        let r = if uninstalling { uninstall(false, &p) } else { install([true, true, false], &p) };
+        log(&format!("silent result: {r:?}"));
+        std::process::exit(if r.is_ok() { 0 } else { 1 });
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
