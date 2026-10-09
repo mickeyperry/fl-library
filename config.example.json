@@ -1,0 +1,10 @@
+{
+  "everything_url": "http://127.0.0.1:8666/",
+  "exclude_prefixes": [],
+  "exclude_contains": [
+    "\\$RECYCLE.BIN\\"
+  ],
+  "port": 8777,
+  "fl_exe": null,
+  "pythonw": null
+}

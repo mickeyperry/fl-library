@@ -1,0 +1,12 @@
+# personal data: your project index, tags, notes, bookmarks, and machine-specific settings
+library.db
+library.db-*
+config.json
+*.log
+
+# build output / generated
+bin/
+icons/
+shellext/target/
+__pycache__/
+*.pyc

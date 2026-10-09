@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FL Library</title>
+<style>
+  :root { --bg:#14161a; --panel:#1c1f25; --line:#2a2e36; --text:#dfe3ea; --dim:#8a92a0; --accent:#ff8a3c;
+          --red:#ff5c5c; --amber:#f0b440; --green:#5fd08a; --blue:#6aa9ff; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+         display: flex; flex-direction: column; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: var(--panel);
+           border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; color: var(--accent); }
+  input, select, textarea, button { background: #11131700; color: var(--text); border: 1px solid var(--line);
+           border-radius: 4px; padding: 4px 7px; font: inherit; }
+  select option { background: var(--panel); }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; background: #262a32; }
+  button:hover { border-color: var(--accent); }
+  #q { width: 300px; }
+  label { color: var(--dim); display: flex; align-items: center; gap: 4px; user-select: none; }
+  #count, #scan { color: var(--dim); }
+  #scan { margin-left: auto; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #list { flex: 1; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { position: sticky; top: 0; background: var(--panel); text-align: left; padding: 6px 8px; cursor: pointer;
+       color: var(--dim); font-weight: 600; border-bottom: 1px solid var(--line); white-space: nowrap; z-index: 1; }
+  th.sorted { color: var(--accent); }
+  td { padding: 4px 8px; border-bottom: 1px solid #20232a; white-space: nowrap; vertical-align: middle; }
+  tr.row { cursor: pointer; }
+  tr.row:hover { background: #1a1d23; }
+  tr.sel { background: #252a35 !important; }
+  td.name { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
+  td.name small, .dim { color: var(--dim); }
+  td.name small { display: block; overflow: hidden; text-overflow: ellipsis; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .star { cursor: pointer; color: #3a3f4a; }
+  .star.on { color: var(--amber); }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 11px; margin-right: 3px;
+           border: 1px solid; }
+  .b-red { color: var(--red); } .b-amber { color: var(--amber); } .b-blue { color: var(--blue); }
+  .b-green { color: var(--green); } .b-dim { color: var(--dim); }
+  select.st { padding: 1px 3px; }
+  .st-idea { color: var(--blue); } .st-wip { color: var(--amber); } .st-mixing { color: var(--accent); }
+  .st-done { color: var(--green); } .st-dead { color: var(--dim); }
+  #more { padding: 10px; text-align: center; }
+  #detail { width: 460px; border-left: 1px solid var(--line); background: var(--panel); overflow: auto;
+            padding: 12px; display: none; }
+  #detail h2 { margin: 0 0 2px; font-size: 16px; }
+  #detail h3 { margin: 14px 0 4px; font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  #detail textarea, #detail input.wide { width: 100%; }
+  #detail textarea { height: 70px; resize: vertical; }
+  .ver { border: 1px solid var(--line); border-radius: 5px; padding: 6px 8px; margin-bottom: 5px; cursor: pointer; }
+  .ver.on { border-color: var(--accent); }
+  .ver .paths { color: var(--dim); font-size: 11px; white-space: normal; word-break: break-all; }
+  .ver button { padding: 1px 6px; font-size: 11px; }
+  .item { white-space: normal; word-break: break-all; padding: 1px 0; font-size: 12px; }
+  .s-missing { color: var(--red); } .s-moved { color: var(--amber); } .s-factory, .s-inzip { color: var(--dim); }
+  #player { display: none; height: 28px; }
+  #toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: #000c;
+           padding: 6px 14px; border-radius: 5px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FL Library</h1>
+  <input id="q" placeholder="search name, folder, plugin, tag..." autofocus>
+  <select id="fStatus"><option value="*">any status</option><option value="">no status</option></select>
+  <select id="fMajor"><option value="">any FL version</option></select>
+  <label><input type="checkbox" id="fFactory" checked> hide factory/demo</label>
+  <label><input type="checkbox" id="fMissing"> missing samples</label>
+  <label><input type="checkbox" id="fRender"> has render</label>
+  <span id="count"></span>
+  <audio id="player" controls></audio>
+  <span id="scan"></span>
+  <button id="rescan" title="Find new and changed projects">Rescan</button>
+</header>
+<main>
+  <div id="list">
+    <table>
+      <thead><tr>
+        <th data-s="name">Song</th><th data-s="status">Status</th><th data-s="rating">Rating</th>
+        <th data-s="bpm" class="num">BPM</th><th data-s="vnum">FL version</th>
+        <th data-s="versions" class="num">Versions</th><th data-s="hours" class="num">Hours</th>
+        <th data-s="mtime">Modified</th><th data-s="missing">Health</th><th data-s="tags">Tags</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="more"></div>
+  </div>
+  <aside id="detail"></aside>
+</main>
+<div id="toast"></div>
+<script>
+const STATUSES = ['idea', 'wip', 'mixing', 'done', 'dead'];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let songs = [], shown = [], byKey = {}, sort = {col: 'mtime', dir: -1}, limit = 300, selected = null, detail = null, verHash = null;
+
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 2500); }
+async function post(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json(); if (d.error) toast(d.error); return d;
+}
+const fmtDate = t => t ? new Date(t * 1000).toISOString().slice(0, 10) : '';
+const vnum = v => { const p = String(v || '').split('.').map(n => parseInt(n) || 0); return (p[0] || 0) * 1e6 + (p[1] || 0) * 1e3 + (p[2] || 0); };
+const statusSelect = s => `<select class="st st-${esc(s.status)}" data-a="status"><option value="">-</option>${STATUSES.map(x => `<option${x === s.status ? ' selected' : ''}>${x}</option>`).join('')}</select>`;
+const stars = s => [1,2,3,4,5].map(i => `<span class="star${i <= s.rating ? ' on' : ''}" data-a="rate" data-v="${i}">&#9733;</span>`).join('');
+
+function health(s) {
+  let h = '';
+  if (s.error) h += `<span class="badge b-red" title="${esc(s.error)}">unreadable</span>`;
+  if (s.missing) h += `<span class="badge b-red">${s.missing} missing</span>`;
+  if (s.moved) h += `<span class="badge b-amber">${s.moved} moved</span>`;
+  if (s.zip) h += '<span class="badge b-blue">zip</span>';
+  if (s.factory) h += '<span class="badge b-dim">factory</span>';
+  return h;
+}
+
+function rowHtml(s) {
+  return `<tr class="row${s.key === selected ? ' sel' : ''}" data-k="${esc(s.key)}">
+    <td class="name" title="${esc(s.path)}">${esc(s.name)}<small>${esc(s.dir)}</small></td>
+    <td>${statusSelect(s)}</td><td>${stars(s)}</td>
+    <td class="num">${s.bpm ? +s.bpm.toFixed(1) : ''}</td><td>${esc(s.version || '')}</td>
+    <td class="num" title="${s.copies} file(s) on disk">${s.versions}</td>
+    <td class="num">${s.hours ? s.hours.toFixed(1) : ''}</td><td>${fmtDate(s.mtime)}</td>
+    <td>${health(s)}</td><td class="dim">${esc(s.tags)}</td>
+    <td>${s.render ? '<button data-a="play" title="Play render">&#9654;</button> ' : ''}<button data-a="open">Open</button></td></tr>`;
+}
+
+function apply() {
+  const tokens = $('q').value.toLowerCase().split(/\s+/).filter(Boolean);
+  const st = $('fStatus').value, mj = $('fMajor').value;
+  const hideF = $('fFactory').checked, miss = $('fMissing').checked, rend = $('fRender').checked;
+  shown = songs.filter(s =>
+    (!hideF || !s.factory) && (!miss || s.missing > 0) && (!rend || s.render) &&
+    (st === '*' || s.status === st) && (!mj || String(s.major) === mj) && tokens.every(t => s.hay.includes(t)));
+  const c = sort.col, d = sort.dir;
+  shown.sort((a, b) => {
+    let x = c === 'vnum' ? vnum(a.version) : a[c], y = c === 'vnum' ? vnum(b.version) : b[c];
+    if (typeof x === 'string' || typeof y === 'string') return d * String(x || '').localeCompare(String(y || ''));
+    return d * ((x || 0) - (y || 0));
+  });
+  $('rows').innerHTML = shown.slice(0, limit).map(rowHtml).join('');
+  $('count').textContent = `${shown.length.toLocaleString()} of ${songs.length.toLocaleString()} songs`;
+  $('more').innerHTML = shown.length > limit ? `<button id="moreBtn">Show more (${(shown.length - limit).toLocaleString()} hidden)</button>` : '';
+  document.querySelectorAll('th').forEach(th => th.classList.toggle('sorted', th.dataset.s === c));
+}
+
+function saveMeta(s) { return post('/api/meta', {key: s.key, status: s.status, tags: s.tags, rating: s.rating, notes: s.notes}); }
+function setHay(s) { s.hay = [s.name, s.dir, s.file, s.title, s.version, s.tags, s.status, s.plugins.join(' ')].join(' ').toLowerCase(); }
+
+async function load() {
+  const d = await (await fetch('/api/songs')).json();
+  songs = d.songs; byKey = {};
+  songs.forEach(s => { setHay(s); byKey[s.key] = s; });
+  const majors = [...new Set(songs.map(s => s.major).filter(m => m != null))].sort((a, b) => a - b);
+  const cur = $('fMajor').value;
+  $('fMajor').innerHTML = '<option value="">any FL version</option>' + majors.map(m => `<option value="${m}">FL ${m}</option>`).join('');
+  $('fMajor').value = cur;
+  showState(d.state);
+  apply();
+}
+
+let poll = null;
+function showState(st) {
+  const scanning = st.scanning === '1';
+  $('scan').textContent = scanning ? (st.progress || 'scanning...') : (st.last_scan ? 'scanned ' + new Date(st.last_scan * 1000).toLocaleString() : 'never scanned');
+  $('rescan').disabled = scanning;
+  if (scanning && !poll) poll = setInterval(async () => {
+    const s = await (await fetch('/api/status')).json();
+    if (s.scanning !== '1') { clearInterval(poll); poll = null; load(); } else showState(s);
+  }, 2000);
+}
+
+function play(path) { const p = $('player'); p.style.display = 'block'; p.src = '/api/audio?path=' + encodeURIComponent(path); p.play(); }
+
+async function openDetail(key) {
+  selected = key; verHash = null;
+  document.querySelectorAll('tr.sel').forEach(r => r.classList.remove('sel'));
+  document.querySelector(`tr[data-k="${CSS.escape(key)}"]`)?.classList.add('sel');
+  detail = (await (await fetch('/api/song?key=' + encodeURIComponent(key))).json()).versions;
+  renderDetail();
+}
+
+function renderDetail() {
+  const s = byKey[selected], el = $('detail');
+  if (!s || !detail) { el.style.display = 'none'; return; }
+  const v = detail.find(x => x.hash === verHash) || detail.find(x => !x.autosave && !x.error) || detail[0];
+  verHash = v.hash;
+  const info = [v.title && 'Title: ' + v.title, v.author && 'Author: ' + v.author, v.genre && 'Genre: ' + v.genre,
+    v.created && 'Created: ' + v.created.slice(0, 10), v.channels && v.channels + ' channels', v.patterns && v.patterns + ' patterns'].filter(Boolean);
+  el.style.display = 'block';
+  el.innerHTML = `<button style="float:right" data-a="close">&times;</button>
+    <h2>${esc(s.name)}</h2><div class="dim item">${esc(s.dir)}</div>
+    <h3>Tags</h3><input class="wide" id="dTags" value="${esc(s.tags)}" placeholder="comma separated">
+    <h3>Notes</h3><textarea id="dNotes">${esc(s.notes)}</textarea>
+    <h3>Versions (${detail.length})</h3>
+    ${detail.map(x => `<div class="ver${x.hash === v.hash ? ' on' : ''}" data-h="${esc(x.hash)}">
+      <b>${esc(x.name)}</b> <span class="dim">${fmtDate(x.mtime)} &middot; FL ${esc(x.version || '?')}${x.bpm ? ' &middot; ' + (+x.bpm.toFixed(1)) + ' bpm' : ''}${x.hours ? ' &middot; ' + x.hours.toFixed(1) + 'h' : ''}</span>
+      ${x.autosave ? '<span class="badge b-dim">autosave</span>' : ''}${x.error ? `<span class="badge b-red">${esc(x.error)}</span>` : ''}${x.missing ? `<span class="badge b-red">${x.missing} missing</span>` : ''}
+      ${x.files.map(f => `<div class="paths">${esc(f.path)} <button data-a="vopen" data-p="${esc(f.path)}">Open</button> <button data-a="reveal" data-p="${esc(f.path)}">Folder</button>${f.render ? ` <button data-a="vplay" data-p="${esc(f.render)}">&#9654;</button>` : ''}</div>`).join('')}
+    </div>`).join('')}
+    <h3>Selected version: ${esc(v.name)}</h3><div class="item dim">${esc(info.join(' · '))}</div>
+    ${v.comment ? `<div class="item">${esc(v.comment)}</div>` : ''}
+    <h3>Plugins (${v.plugins.length})</h3>
+    ${v.plugins.map(p => `<div class="item">${esc(p.name)}${p.count > 1 ? ' &times;' + p.count : ''} <span class="dim">${p.kind === 'gen' ? 'instrument' : 'effect'}${p.vst ? ' &middot; VST' : ''}${p.vendor ? ' &middot; ' + esc(p.vendor) : ''}</span></div>`).join('') || '<div class="dim">none</div>'}
+    <h3>Samples (${v.samples.length})</h3>
+    ${v.samples.map(x => `<div class="item s-${x.status}">[${x.status}] ${esc(x.path)}${x.found ? `<div class="dim">&rarr; ${esc(x.found)}</div>` : ''}</div>`).join('') || '<div class="dim">none</div>'}`;
+}
+
+$('rows').addEventListener('click', e => {
+  const tr = e.target.closest('tr.row'); if (!tr) return;
+  const s = byKey[tr.dataset.k], a = e.target.dataset.a;
+  if (a === 'rate') { const v = +e.target.dataset.v; s.rating = s.rating === v ? 0 : v; saveMeta(s); tr.children[2].innerHTML = stars(s); }
+  else if (a === 'play') play(s.render);
+  else if (a === 'open') post('/api/open', {path: s.path}).then(d => d.ok && toast('Opening in FL Studio...'));
+  else if (a !== 'status') openDetail(s.key);
+});
+$('rows').addEventListener('change', e => {
+  if (e.target.dataset.a !== 'status') return;
+  const s = byKey[e.target.closest('tr').dataset.k];
+  s.status = e.target.value; e.target.className = 'st st-' + s.status; setHay(s); saveMeta(s);
+});
+$('detail').addEventListener('click', e => {
+  const a = e.target.dataset.a;
+  if (a === 'close') { selected = null; $('detail').style.display = 'none'; }
+  else if (a === 'vopen') post('/api/open', {path: e.target.dataset.p}).then(d => d.ok && toast('Opening in FL Studio...'));
+  else if (a === 'reveal') post('/api/reveal', {path: e.target.dataset.p});
+  else if (a === 'vplay') play(e.target.dataset.p);
+  else { const v = e.target.closest('.ver'); if (v && v.dataset.h !== verHash) { verHash = v.dataset.h; renderDetail(); } }
+});
+$('detail').addEventListener('change', e => {
+  const s = byKey[selected]; if (!s) return;
+  if (e.target.id === 'dTags') s.tags = e.target.value.trim();
+  else if (e.target.id === 'dNotes') s.notes = e.target.value;
+  else return;
+  setHay(s); saveMeta(s).then(() => toast('Saved'));
+  const tr = document.querySelector(`tr[data-k="${CSS.escape(s.key)}"]`); if (tr) tr.children[9].textContent = s.tags;
+});
+document.querySelector('thead').addEventListener('click', e => {
+  const c = e.target.dataset.s; if (!c) return;
+  sort = {col: c, dir: sort.col === c ? -sort.dir : (c === 'name' || c === 'tags' ? 1 : -1)}; apply();
+});
+$('more').addEventListener('click', e => { if (e.target.id === 'moreBtn') { limit += 500; apply(); } });
+['q', 'fStatus', 'fMajor', 'fFactory', 'fMissing', 'fRender'].forEach(id => $(id).addEventListener('input', () => { limit = 300; apply(); }));
+$('rescan').addEventListener('click', async () => { await post('/api/rescan', {}); showState({scanning: '1', progress: 'starting scan...'}); });
+$('fStatus').insertAdjacentHTML('beforeend', STATUSES.map(s => `<option>${s}</option>`).join(''));
+load();
+</script>
+</body>
+</html>

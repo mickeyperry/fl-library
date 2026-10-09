@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<schema xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns="http://schemas.microsoft.com/windows/2006/propertydescription"
+        schemaVersion="1.0">
+  <propertyDescriptionList publisher="FLLibrary" product="FLLibrary">
+    <propertyDescription name="FLLibrary.FLVersion" formatID="{B5F0A2C4-1E6D-4F3A-8B7E-9C2D4A6E8F10}" propID="2">
+      <searchInfo inInvertedIndex="false" isColumn="false"/>
+      <typeInfo type="String" multipleValues="false" isInnate="true" isViewable="true" isQueryable="false"/>
+      <labelInfo label="FL version"/>
+      <displayInfo displayType="String" defaultColumnWidth="14" alignment="Left"/>
+    </propertyDescription>
+    <propertyDescription name="FLLibrary.Status" formatID="{B5F0A2C4-1E6D-4F3A-8B7E-9C2D4A6E8F10}" propID="3">
+      <searchInfo inInvertedIndex="false" isColumn="false"/>
+      <typeInfo type="String" multipleValues="false" isInnate="true" isViewable="true" isQueryable="false"/>
+      <labelInfo label="Project status"/>
+      <displayInfo displayType="String" defaultColumnWidth="12" alignment="Left"/>
+    </propertyDescription>
+    <propertyDescription name="FLLibrary.MissingSamples" formatID="{B5F0A2C4-1E6D-4F3A-8B7E-9C2D4A6E8F10}" propID="4">
+      <searchInfo inInvertedIndex="false" isColumn="false"/>
+      <typeInfo type="UInt32" multipleValues="false" isInnate="true" isViewable="true" isQueryable="false"/>
+      <labelInfo label="Missing samples"/>
+      <displayInfo displayType="Number" defaultColumnWidth="10" alignment="Right"/>
+    </propertyDescription>
+    <propertyDescription name="FLLibrary.HoursWorked" formatID="{B5F0A2C4-1E6D-4F3A-8B7E-9C2D4A6E8F10}" propID="5">
+      <searchInfo inInvertedIndex="false" isColumn="false"/>
+      <typeInfo type="Double" multipleValues="false" isInnate="true" isViewable="true" isQueryable="false"/>
+      <labelInfo label="Hours worked"/>
+      <displayInfo displayType="Number" defaultColumnWidth="10" alignment="Right"/>
+    </propertyDescription>
+    <propertyDescription name="FLLibrary.Versions" formatID="{B5F0A2C4-1E6D-4F3A-8B7E-9C2D4A6E8F10}" propID="6">
+      <searchInfo inInvertedIndex="false" isColumn="false"/>
+      <typeInfo type="UInt32" multipleValues="false" isInnate="true" isViewable="true" isQueryable="false"/>
+      <labelInfo label="Song versions"/>
+      <displayInfo displayType="Number" defaultColumnWidth="10" alignment="Right"/>
+    </propertyDescription>
+    <propertyDescription name="FLLibrary.Channels" formatID="{B5F0A2C4-1E6D-4F3A-8B7E-9C2D4A6E8F10}" propID="7">
+      <searchInfo inInvertedIndex="false" isColumn="false"/>
+      <typeInfo type="UInt32" multipleValues="false" isInnate="true" isViewable="true" isQueryable="false"/>
+      <labelInfo label="Channels"/>
+      <displayInfo displayType="Number" defaultColumnWidth="8" alignment="Right"/>
+    </propertyDescription>
+  </propertyDescriptionList>
+</schema>
