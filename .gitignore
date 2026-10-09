@@ -16,3 +16,4 @@ build/
 dist/
 installer/target/
 installer/payload.zip
+installer/target-dbg/

@@ -76,7 +76,7 @@ enum Page {
     UninstallAsk,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Act {
     Close,
     Install,
@@ -674,6 +674,10 @@ impl Paint {
         let _ = DeleteObject(pen);
     }
     unsafe fn text(&self, rc: RECT, s: &str, size: i32, weight: i32, color: u32, flags: DRAW_TEXT_FORMAT) {
+        // an empty slice is a dangling pointer; DrawTextW's ellipsis handling dereferences it
+        if s.is_empty() {
+            return;
+        }
         let font = CreateFontW(-self.px(size), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
         let of = SelectObject(self.hdc, font);
         SetBkMode(self.hdc, TRANSPARENT);
@@ -926,6 +930,7 @@ unsafe fn start_work(hwnd: HWND, app: &mut App) {
 }
 
 unsafe fn act(hwnd: HWND, app: &mut App, a: Act) {
+    log(&format!("click: {a:?}"));
     match a {
         Act::Close => {
             if app.page != Page::Working {
@@ -975,6 +980,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_DPICHANGED => {
+            // dragged to a monitor with different scaling: redraw at the new size
+            app.dpi = ((wp.0 & 0xFFFF) as i32).max(96);
+            let rc = &*(lp.0 as *const RECT);
+            let _ = SetWindowPos(hwnd, None, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            LRESULT(0)
+        }
         WM_TIMER => {
             app.tick = app.tick.wrapping_add(1);
             for c in app.confetti.iter_mut() {
@@ -1024,12 +1036,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
+            log("WM_CLOSE");
             if app.page != Page::Working {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
         WM_DESTROY => {
+            log("WM_DESTROY");
             PostQuitMessage(0);
             LRESULT(0)
         }
