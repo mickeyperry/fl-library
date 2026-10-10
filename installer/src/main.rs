@@ -40,6 +40,7 @@ const KEY_UNINSTALL: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Unins
 const KEY_RUN: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 const KEY_ASSOC: &str = "SOFTWARE\\Classes\\SystemFileAssociations\\.flp";
 const TASK: &str = "FL Library scan";
+const TASK_SYNC: &str = "FL Library sync";
 const NO_WINDOW: u32 = 0x0800_0000;
 
 // ---------- look ----------
@@ -549,6 +550,9 @@ fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
     if !out.status.success() {
         return Err(format!("could not create the scan task: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
+    // tags / bookmarks shared with other PCs through config.json "sync_dir": pull every 5 minutes
+    let sync = format!("{} {} sync", quoted(&pythonw), quoted(&app.join("flctl.py")));
+    let _ = hidden(Command::new("schtasks").args(["/Create", "/F", "/TN", TASK_SYNC, "/SC", "MINUTE", "/MO", "5", "/TR", &sync])).output();
 
     // 5. Apps & features entry, startup, launch
     p.send(0.9, "Almost there", "Adding FL Library to Apps & features");
@@ -586,6 +590,7 @@ fn uninstall(delete_library: bool, p: &Progress) -> std::result::Result<(), Stri
     p.send(0.1, "Stopping FL Library", "");
     stop_panel();
     let _ = hidden(Command::new("schtasks").args(["/Delete", "/F", "/TN", TASK])).output();
+    let _ = hidden(Command::new("schtasks").args(["/Delete", "/F", "/TN", TASK_SYNC])).output();
 
     p.send(0.3, "Removing it from Explorer", "");
     let sw = wide(&dir.join("flprops.propdesc").to_string_lossy());

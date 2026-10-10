@@ -27,5 +27,6 @@ Remove-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersio
 Remove-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'FLLibraryPanel' -ErrorAction SilentlyContinue
 Get-Process flpanel -ErrorAction SilentlyContinue | Stop-Process -Force
 schtasks /Delete /F /TN 'FL Library scan' 2>$null | Out-Null
+schtasks /Delete /F /TN 'FL Library sync' 2>$null | Out-Null
 [FL.Prop]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
 Write-Output 'uninstalled (restart Explorer to unload the DLL)'

@@ -6,6 +6,7 @@ import mmap
 import ntpath
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -35,7 +36,58 @@ DEFAULT_CONFIG = {
     'exclude_contains': ['\\$RECYCLE.BIN\\'],
     'port': 8777,
     'fl_exe': None,
+    # a folder every PC can reach (NAS / shared folder): tags, status, ratings, notes and bookmarks
+    # are shared through it, e.g. "\\\\nas\\music\\FL Library sync"
+    'sync_dir': None,
 }
+
+META_COLS = ('status', 'tags', 'rating', 'notes', 'bookmark', 'updated')
+META_UPSERT = (
+    'INSERT INTO meta(song_key, status, tags, rating, notes, bookmark, updated) VALUES(?,?,?,?,?,?,?) '
+    'ON CONFLICT(song_key) DO UPDATE SET status = excluded.status, tags = excluded.tags, '
+    'rating = excluded.rating, notes = excluded.notes, bookmark = excluded.bookmark, updated = excluded.updated')
+
+
+def sync_meta(db, cfg=None):
+    """Share your per-song data between PCs through `sync_dir`.
+
+    Song keys are folder + name, not paths, so they match across machines. Every PC writes only its
+    own meta-<host>.json (no two writers on one file) and merges everyone else's in; per song the
+    newest `updated` wins. Returns the number of songs updated from other PCs, or None if not set up.
+    """
+    cfg = cfg or load_config()
+    sync_dir = cfg.get('sync_dir')
+    if not sync_dir:
+        return None
+    try:
+        os.makedirs(sync_dir, exist_ok=True)
+    except OSError:
+        return None  # share not reachable right now; next run will catch up
+    mine = os.path.join(sync_dir, f'meta-{socket.gethostname().lower()}.json')
+    local = {r[0]: dict(zip(META_COLS, r[1:]))
+             for r in db.execute('SELECT song_key, status, tags, rating, notes, bookmark, updated FROM meta')}
+    merged = 0
+    for path in glob.glob(os.path.join(sync_dir, 'meta-*.json')):
+        if os.path.normcase(path) == os.path.normcase(mine):
+            continue
+        try:
+            with open(path, encoding='utf-8') as f:
+                theirs = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for key, m in theirs.items():
+            if (m.get('updated') or 0) > (local.get(key, {}).get('updated') or 0):
+                row = {c: m.get(c) for c in META_COLS}
+                local[key] = row
+                db.execute(META_UPSERT, (key, row['status'] or '', row['tags'] or '', int(row['rating'] or 0),
+                                         row['notes'] or '', int(row['bookmark'] or 0), int(row['updated'] or 0)))
+                merged += 1
+    db.commit()
+    tmp = mine + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump({k: v for k, v in local.items() if v.get('updated')}, f, ensure_ascii=False)
+    os.replace(tmp, mine)
+    return merged
 
 AUDIO_EXTS = ('wav', 'mp3', 'ogg', 'flac', 'aif', 'aiff', 'wv', 'm4a')
 RENDER_EXTS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a')
@@ -498,6 +550,9 @@ def scan(recheck=False):
             db.execute('UPDATE files SET song_key = ?, song_name = ?, is_autosave = ? WHERE path = ?',
                        (key, sname, int(autosave), path))
     reflag(db)
+    merged = sync_meta(db, cfg)
+    if merged:
+        progress(f'synced {merged} song(s) from other PCs')
     db.execute("INSERT OR REPLACE INTO state VALUES('last_scan', ?)", (str(int(time.time())),))
     db.execute("INSERT OR REPLACE INTO state VALUES('scanning', '0')")
     n_files = db.execute('SELECT COUNT(*) FROM files').fetchone()[0]

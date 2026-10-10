@@ -130,6 +130,8 @@ foreach ($k in $items.Keys) {
 # keep the index fresh: incremental scan every 30 minutes
 $scan = '"{0}" "{1}"' -f $pythonw, (Join-Path $root 'scanner.py')
 schtasks /Create /F /TN 'FL Library scan' /SC MINUTE /MO 30 /TR $scan | Out-Null
+# pull tags / bookmarks from other PCs (config.json "sync_dir") every 5 minutes
+schtasks /Create /F /TN 'FL Library sync' /SC MINUTE /MO 5 /TR "$ctl sync" | Out-Null
 
 [FL.Prop]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)  # SHCNE_ASSOCCHANGED
 Write-Output "installed: $dll"

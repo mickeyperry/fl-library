@@ -61,6 +61,9 @@ def set_field(field, value, path):
     paths = [r[0] for r in db.execute("SELECT path FROM files WHERE song_key = ? AND kind = 'flp'", (key,))]
     db.close()
     refresh(paths)
+    db = scanner.connect()
+    scanner.sync_meta(db)  # push the change to the other PCs right away
+    db.close()
 
 
 def show_samples(path):
@@ -174,6 +177,10 @@ def main(argv):
         show_samples(argv[1])
     elif cmd == 'versions':
         show_versions(argv[1])
+    elif cmd == 'sync':  # scheduled every few minutes: pull other PCs' changes
+        db = scanner.connect()
+        scanner.sync_meta(db)
+        db.close()
     elif cmd == 'rescan':
         subprocess.Popen([sys.executable, os.path.join(HERE, 'scanner.py')], cwd=HERE,
                          creationflags=subprocess.CREATE_NO_WINDOW)

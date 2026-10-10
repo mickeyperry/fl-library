@@ -88,6 +88,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1     # uninstall.ps1 to remo
 | `exclude_contains` | skip any path containing these |
 | `pythonw` | which `pythonw.exe` to use; defaults to the first one on PATH |
 | `port` | port of the optional browser UI (`python server.py`) |
+| `sync_dir` | a folder every PC can reach (NAS / shared folder). Tags, status, ratings, notes and bookmarks are shared through it: each PC writes its own `meta-<host>.json` there and merges the others', newest change wins. Set the same folder on every PC. |
 
 ## How it works
 
