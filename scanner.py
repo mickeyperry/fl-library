@@ -275,11 +275,15 @@ def fl_known_plugins():
     base = os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Presets', 'Plugin database', 'Installed')
     for root, _dirs, files in os.walk(base):
         for f in files:
-            if f.lower().endswith('.nfo'):
+            if f.lower().endswith('.nfo') or f.lower() == '.plugins.ini':  # FL 20+ keeps one .Plugins.ini
                 try:
-                    for line in open(os.path.join(root, f), encoding='utf-8', errors='replace'):
+                    for line in open(os.path.join(root, f), encoding='utf-8-sig', errors='replace'):
                         if line.startswith('ps_file_filename_'):
-                            paths.add(line.split('=', 1)[1].strip().lower())
+                            p = line.split('=', 1)[1].strip().lower()
+                            # the database may be a copy from another PC (synced Documents):
+                            # only files that are really here count. %FLPath% ones are FL's own.
+                            if '%' in p or os.path.exists(p):
+                                paths.add(p)
                 except OSError:
                     pass
     return paths
@@ -568,8 +572,11 @@ def store(db, audio, path, container, kind, directory, name, size, mtime, h, inf
     if err or not info:
         h = 'err:' + hashlib.sha1(path.encode('utf-8', 'replace')).hexdigest()
         db.execute('INSERT OR REPLACE INTO projects(hash, error) VALUES(?,?)', (h, err or 'unknown'))
-    elif audio is None and db.execute('SELECT 1 FROM projects WHERE hash = ?', (h,)).fetchone():
-        pass  # same content already indexed with resolved samples
+    elif audio is None and (row := db.execute('SELECT plugins FROM projects WHERE hash = ?', (h,)).fetchone()):
+        # same content already indexed with resolved samples: keep those, but a row written by an
+        # old scanner (no plugin paths) gets its plugin list refreshed
+        if not row[0] or '"path"' not in row[0]:
+            db.execute('UPDATE projects SET plugins = ? WHERE hash = ?', (json.dumps(info['plugins'], ensure_ascii=False), h))
     else:
         samples, n_missing, n_moved = resolve_samples(info['samples'], audio, zip_names)
         ver = info['version'] or ''

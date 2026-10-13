@@ -494,11 +494,18 @@ fn read_fl_installed_files() -> std::collections::HashSet<String> {
                 let p = e.path();
                 if p.is_dir() {
                     dirs.push(p);
-                } else if p.extension().map(|x| x.eq_ignore_ascii_case("nfo")).unwrap_or(false) {
+                } else if p.extension().map(|x| x.eq_ignore_ascii_case("nfo")).unwrap_or(false)
+                    || p.file_name().map(|x| x.eq_ignore_ascii_case(".Plugins.ini")).unwrap_or(false)
+                {
                     if let Ok(text) = std::fs::read_to_string(&p) {
                         for line in text.lines().filter(|l| l.starts_with("ps_file_filename_")) {
                             if let Some((_, v)) = line.split_once('=') {
-                                set.insert(v.trim().rsplit(SEP).next().unwrap_or(v).to_lowercase());
+                                let v = v.trim();
+                                // the database may be a copy from another PC (synced Documents):
+                                // only files that are really here count. %FLPath% ones are FL's own.
+                                if v.contains('%') || std::path::Path::new(v).exists() {
+                                    set.insert(v.rsplit(SEP).next().unwrap_or(v).to_lowercase());
+                                }
                             }
                         }
                     }
