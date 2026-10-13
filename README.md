@@ -22,6 +22,11 @@ list. It never moves or changes your project files.
     version the project was made with (the nearest installed one). Ctrl+double-click shows the file
     in the current Explorer window.
   - **Hide demos:** hides FL's own demo, template, tutorial and performance-mode projects.
+  - **Fetch plugins:** a project's plugin line shows which VSTs are missing on this PC. The button
+    finds each one through Everything (this PC's other drives, network shares, and other PCs listed
+    under `peers` in `config.json`), prefers the 64-bit copy, and copies it, with its support files,
+    to the exact path the project expects, so FL loads it without a rescan. Plugins that need their
+    installer get a list of installer candidates found on your drives instead.
   - **Colours:** each project folder gets its own colour.
 - **Explorer columns for `.flp` files:** FL version, BPM, status, rating, hours worked, missing
   samples and versions. Right-click a column header → More…
@@ -88,6 +93,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1     # uninstall.ps1 to remo
 | `exclude_contains` | skip any path containing these |
 | `pythonw` | which `pythonw.exe` to use; defaults to the first one on PATH |
 | `port` | port of the optional browser UI (`python server.py`) |
+| `peers` | other PCs to fetch missing plugins from: `[{"everything": "http://<ip>:8666/", "share": "\\\\<ip>\\{drive}"}]`. Each needs Everything's HTTP server reachable over the network (allow it through its firewall) and a share that maps its drive letters (`{drive}` is replaced by the letter). Network shares that this PC's Everything already indexes are searched without any setup. |
 | `sync_dir` | a folder every PC can reach (NAS / shared folder). Tags, status, ratings, notes and bookmarks are shared through it: each PC writes its own `meta-<host>.json` there and merges the others', newest change wins. Set the same folder on every PC. |
 
 ## How it works

@@ -1,5 +1,6 @@
 """Explorer right-click actions: flctl.py status|rating|tags|notes|rescan ..."""
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -168,10 +169,209 @@ def color_subfolders(root):
     return done, not already
 
 
+PE_X64, PE_X86 = 0x8664, 0x14C
+
+
+def pe_machine(path):
+    """0x8664 (64-bit) / 0x14c (32-bit) / None."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+        pe = int.from_bytes(head[0x3C:0x40], 'little')
+        return int.from_bytes(head[pe + 4:pe + 6], 'little') if head[pe:pe + 4] == b'PE\0\0' else None
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def everything_hits(url, search, limit=50):
+    """Full paths from an Everything HTTP server (ours or another PC's)."""
+    import urllib.parse
+    import urllib.request
+    qs = urllib.parse.urlencode({'json': 1, 'path_column': 1, 'size_column': 1, 'count': limit, 'search': search})
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/?' + qs, timeout=6) as r:
+            data = json.load(r)
+    except (OSError, ValueError):
+        return []
+    return [(x['path'] + '\\' + x['name'], int(x.get('size') or 0)) for x in data.get('results', []) if x.get('path')]
+
+
+def fl_known_plugins():
+    """Plugin DLL paths FL's own plugin database lists as installed on this PC."""
+    paths = set()
+    base = os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Presets', 'Plugin database', 'Installed')
+    for root, _dirs, files in os.walk(base):
+        for f in files:
+            if f.lower().endswith('.nfo'):
+                try:
+                    for line in open(os.path.join(root, f), encoding='utf-8', errors='replace'):
+                        if line.startswith('ps_file_filename_'):
+                            paths.add(line.split('=', 1)[1].strip().lower())
+                except OSError:
+                    pass
+    return paths
+
+
+def missing_plugins(db, flp):
+    """VST plugins a project refers to whose DLL is not on this PC: [(name, stored path)]."""
+    row = db.execute('SELECT p.plugins FROM files f JOIN projects p ON p.hash = f.hash '
+                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+    plugins = json.loads(row[0]) if row and row[0] else []
+    if not plugins or not any('path' in p for p in plugins):
+        info = scanner.flparse.parse_file(flp)  # not indexed yet (or indexed before paths were stored)
+        plugins = info['plugins']
+    known = None
+    out = []
+    for p in plugins:
+        path = p.get('path')
+        if not path or path.startswith('\\\\'):
+            continue
+        if os.path.exists(path):
+            continue
+        if known is None:
+            known = fl_known_plugins()
+            known_names = {os.path.basename(k) for k in known}
+        # FL finds a plugin by name after its own scan, so the same file in another plugin folder counts
+        if path.lower() in known or os.path.basename(path.lower()) in known_names:
+            continue
+        out.append((p['name'], path))
+    return out
+
+
+def plugin_sources(cfg, name, path):
+    """Where a copy of this plugin's file can be fetched from, best first: [(source path, note)]."""
+    import re
+    base = os.path.basename(path)
+    stem, ext = os.path.splitext(base)
+    cands = []
+    here = cfg['everything_url']
+    for full, size in everything_hits(here, f'file: whole:"{base}"'):
+        cands.append((full, size, 'network share' if full.startswith('\\\\') else 'this PC'))
+    for peer in cfg.get('peers') or []:
+        for full, size in everything_hits(peer['everything'], f'file: whole:"{base}"'):
+            if re.match(r'^[A-Za-z]:\\', full) and peer.get('share'):
+                unc = peer['share'].replace('{drive}', full[0]) + full[2:]
+                cands.append((unc, size, peer['everything']))
+    want64 = ext.lower() in ('.dll', '.vst3')
+    scored = []
+    for full, size, where in cands:
+        low = full.lower()
+        if low == path.lower() or '$recycle.bin' in low or '\\temp\\' in low:
+            continue
+        if size and size < 32 * 1024 and '.64.' in low:
+            continue  # a 32->64-bit bridge stub, not the plugin
+        score = 0
+        if low.endswith(os.path.dirname(path).lower().split('\\')[-1] + '\\' + base.lower()):
+            score += 3  # same folder name as the project expects
+        machine = pe_machine(full) if want64 else None
+        if machine == PE_X64:
+            score += 2
+        elif machine == PE_X86:
+            score += 1
+        if where == 'this PC':
+            score += 1
+        scored.append((score, full, where))
+    scored.sort(key=lambda t: -t[0])
+    return [(full, where) for _, full, where in scored]
+
+
+def installer_candidates(cfg, name):
+    """Setup programs on your drives that look like this plugin's installer."""
+    import re
+    stem = re.sub(r'[^a-z0-9]+', ' ', name.lower()).split()
+    if not stem:
+        return []
+    word = max(stem, key=len)
+    hits = everything_hits(cfg['everything_url'], f'file: ext:exe;msi {word} <setup|install|installer>', 20)
+    return [full for full, _ in hits if not full.lower().startswith('c:\\program files')][:3]
+
+
+def copy_plugin(src, dest):
+    """Copy the plugin file to where the project expects it, plus the support files next to it."""
+    import shutil
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(src, dest)
+    sdir, ddir = os.path.dirname(src), os.path.dirname(dest)
+    stem = os.path.splitext(os.path.basename(src))[0].lower()
+    folder_is_plugins = os.path.basename(sdir).lower() in ('vstplugins', 'vstplugins64', 'vst', 'vst2', 'vst3', 'plugins', 'steinberg')
+    for entry in os.listdir(sdir):
+        s = os.path.join(sdir, entry)
+        if os.path.normcase(s) == os.path.normcase(src):
+            continue
+        same_stem = os.path.splitext(entry)[0].lower().startswith(stem)
+        if same_stem or not folder_is_plugins:  # a plugin in its own folder: bring the whole folder
+            d = os.path.join(ddir, entry)
+            try:
+                if os.path.isdir(s):
+                    shutil.copytree(s, d, dirs_exist_ok=True)
+                elif not os.path.exists(d):
+                    shutil.copy2(s, d)
+            except OSError:
+                pass
+
+
+def fetch_plugins(flp, elevated=False):
+    """Find each missing plugin on your other PCs / drives and copy it to the path the project
+    expects, so FL loads it with no rescan. Re-runs itself elevated when Program Files is involved."""
+    flp = os.path.abspath(flp)
+    cfg = scanner.load_config()
+    db = scanner.connect()
+    missing = missing_plugins(db, flp)
+    db.close()
+    if not missing:
+        ctypes.windll.user32.MessageBoxW(None, 'All plugins this project uses are on this PC.', 'FL Library', 0x40)
+        return
+    plan = []
+    for name, path in missing:
+        sources = plugin_sources(cfg, name, path)
+        plan.append((name, path, sources))
+    needs_admin = any(not os.access(nearest_existing_dir(path), os.W_OK) for _n, path, srcs in plan if srcs)
+    if needs_admin and not elevated:
+        params = f'"{os.path.abspath(__file__)}" fetchplugins-elevated "{flp}"'
+        if ctypes.windll.shell32.ShellExecuteW(None, 'runas', sys.executable, params, None, 1) > 32:
+            return
+        ctypes.windll.user32.MessageBoxW(None, 'Admin permission is needed to copy into Program Files.', 'FL Library', 0x30)
+        return
+    report = []
+    for name, path, sources in plan:
+        done = False
+        for src, where in sources:
+            try:
+                copy_plugin(src, path)
+                report.append(f'OK  {name}\n      from {src}')
+                done = True
+                break
+            except OSError as e:
+                report.append(f'--  {name}: could not copy from {src} ({e})')
+        if not done:
+            inst = installer_candidates(cfg, name)
+            if inst:
+                report.append(f'??  {name}: no copy found; installer candidates:\n      ' + '\n      '.join(inst))
+            else:
+                report.append(f'XX  {name}: not found on any drive or PC\n      expected at {path}')
+    ok = sum(r.startswith('OK') for r in report)
+    text = f'{ok} of {len(plan)} missing plugin(s) copied.\n\n' + '\n'.join(report)
+    text += '\n\nPlugins that came with an installer (licensed / with data folders) may still need to be installed properly.'
+    ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - fetch plugins', 0x40 if ok == len(plan) else 0x30)
+
+
+def nearest_existing_dir(path):
+    d = os.path.dirname(path)
+    while d and not os.path.isdir(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return d or '.'
+
+
 def main(argv):
     cmd = argv[0]
     if cmd == 'colorfolders':
         color_subfolders(argv[1])
+        return
+    if cmd in ('fetchplugins', 'fetchplugins-elevated'):
+        fetch_plugins(argv[1], elevated=cmd.endswith('elevated'))
         return
     if cmd == 'samples':
         show_samples(argv[1])

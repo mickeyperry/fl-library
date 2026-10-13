@@ -120,7 +120,7 @@ def parse_buffer(buf):
             plugins[key]['count'] += 1
         else:
             plugins[key] = {'name': name, 'vendor': p['vendor'], 'kind': p['kind'],
-                            'vst': p['wrapper'], 'count': 1}
+                            'vst': p['wrapper'], 'count': 1, 'path': p['path']}
 
     while pos < end:
         eid = buf[pos]
@@ -205,14 +205,14 @@ def parse_buffer(buf):
             chan_ctx = 0
             if name:
                 pending = {'name': name, 'wrapper': name.lower() == WRAPPER, 'kind': kind,
-                           'vst': None, 'vendor': None, 'alt': None}
+                           'vst': None, 'vendor': None, 'alt': None, 'path': None}
         elif eid == EV_PLUGIN_NAME:
             if pending and pending['wrapper'] and not pending['alt']:
                 pending['alt'] = _text(buf[start:pos], utf16) or None
         elif eid == EV_PLUGIN_PARAMS:
             if pending and pending['wrapper'] and not pending['vst']:
-                vname, vendor, _ = _parse_wrapper(buf[start:pos])
-                pending['vst'], pending['vendor'] = vname, vendor
+                vname, vendor, vpath = _parse_wrapper(buf[start:pos])
+                pending['vst'], pending['vendor'], pending['path'] = vname, vendor, vpath or None
     flush()
 
     if info['bpm'] is None and tempo_old:

@@ -39,6 +39,10 @@ DEFAULT_CONFIG = {
     # a folder every PC can reach (NAS / shared folder): tags, status, ratings, notes and bookmarks
     # are shared through it, e.g. "\\\\nas\\music\\FL Library sync"
     'sync_dir': None,
+    # other PCs whose plugins can be fetched: their Everything HTTP server, and how a drive letter
+    # there maps to a share reachable from here ({drive} = the letter), e.g.
+    # [{"everything": "http://<ip>:8666/", "share": "\\\\<ip>\\{drive}"}]
+    'peers': [],
 }
 
 META_COLS = ('status', 'tags', 'rating', 'notes', 'bookmark', 'updated')

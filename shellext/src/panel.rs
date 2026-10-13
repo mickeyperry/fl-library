@@ -45,6 +45,7 @@ const C_BG: u32 = rgb(32, 33, 37);
 const C_FIELD: u32 = rgb(44, 46, 52);
 const C_BTN: u32 = rgb(60, 62, 70);
 const C_BTN_DOWN: u32 = rgb(78, 80, 90);
+const C_RED: u32 = rgb(255, 95, 95);
 const C_BORDER: u32 = rgb(86, 88, 98);
 const C_TEXT: u32 = rgb(228, 228, 232);
 const C_DIM: u32 = rgb(152, 154, 162);
@@ -74,6 +75,7 @@ const ID_FIND: i32 = 132;
 const ID_FOLDER: i32 = 133;
 const ID_OPEN_ORIG: i32 = 134;
 const ID_BOOKMARK: i32 = 135;
+const ID_FETCH: i32 = 136; // copy missing plugins from other PCs / drives
 const ID_SAMPLES_LABEL: i32 = 140;
 const ID_SAMPLES: i32 = 141;
 const ID_VERSIONS_LABEL: i32 = 150;
@@ -384,6 +386,7 @@ struct Song {
     notes: String,
     samples: Vec<String>,
     sample_summary: String,
+    plugins_missing: Vec<String>,
     versions: Vec<Row>,
     inside: Vec<Row>,  // folder mode: projects under the folder
     results: Vec<Row>, // what the results table currently shows
@@ -444,6 +447,35 @@ fn row_from(r: &[String]) -> Row {
         demo: r[12] == "1",
         color: color_for(if color_key(&r[8]).is_empty() { &r[11] } else { color_key(&r[8]) }),
     }
+}
+
+/// File names (lower-case) of every plugin FL's own plugin database lists as installed on this PC.
+fn fl_installed_files() -> &'static std::collections::HashSet<String> {
+    static FILES: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    FILES.get_or_init(|| {
+        let mut set = std::collections::HashSet::new();
+        let Ok(profile) = std::env::var("USERPROFILE") else { return set };
+        let base = std::path::PathBuf::from(profile).join("Documents\\Image-Line\\FL Studio\\Presets\\Plugin database\\Installed");
+        let mut dirs = vec![base];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().map(|x| x.eq_ignore_ascii_case("nfo")).unwrap_or(false) {
+                    if let Ok(text) = std::fs::read_to_string(&p) {
+                        for line in text.lines().filter(|l| l.starts_with("ps_file_filename_")) {
+                            if let Some((_, v)) = line.split_once('=') {
+                                set.insert(v.trim().rsplit(SEP).next().unwrap_or(v).to_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        set
+    })
 }
 
 fn load_folder(s: &mut Song) {
@@ -522,8 +554,23 @@ fn load_project(s: &mut Song, file_name: &str) {
 
         if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&r[3]) {
             let names: Vec<&str> = items.iter().filter_map(|p| p["name"].as_str()).collect();
+            // a VST whose DLL is neither where the project expects it nor known to FL's plugin
+            // database under that file name (local paths only: no UNC probing)
+            let installed = fl_installed_files();
+            s.plugins_missing = items
+                .iter()
+                .filter(|p| p["path"].as_str().map(|q| {
+                    let file = q.rsplit(SEP).next().unwrap_or(q).to_lowercase();
+                    !q.starts_with("\\\\") && !std::path::Path::new(q).exists() && !installed.contains(&file)
+                }).unwrap_or(false))
+                .filter_map(|p| p["name"].as_str().map(str::to_string))
+                .collect();
             if !names.is_empty() {
-                s.plugins = format!("Plugins ({}): {}", names.len(), names.join(", "));
+                s.plugins = if s.plugins_missing.is_empty() {
+                    format!("Plugins ({}): {}", names.len(), names.join(", "))
+                } else {
+                    format!("Plugins ({}){DOT}{} MISSING: {}{DOT}{}", names.len(), s.plugins_missing.len(), s.plugins_missing.join(", "), names.join(", "))
+                };
             }
         }
         if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&r[2]) {
@@ -596,6 +643,7 @@ fn load(path: &str) -> Song {
         notes: String::new(),
         samples: Vec::new(),
         sample_summary: "SAMPLES: not indexed yet (rescan runs every 30 min)".into(),
+        plugins_missing: Vec::new(),
         versions: Vec::new(),
         inside: Vec::new(),
         results: Vec::new(),
@@ -1242,6 +1290,10 @@ unsafe fn build(hwnd: HWND, s: &Song) {
     button(hwnd, "All copies", ID_FIND, s.font);
     button(hwnd, "Folder", ID_FOLDER, s.font);
     button(hwnd, "\u{2605} Bookmark", ID_BOOKMARK, s.font);
+    let fetch = button(hwnd, "Fetch plugins", ID_FETCH, s.font);
+    if s.plugins_missing.is_empty() {
+        let _ = EnableWindow(fetch, false);
+    }
     child(hwnd, w!("STATIC"), &s.sample_summary, SS_NOPREFIX | SS_ENDELLIPSIS, 0, ID_SAMPLES_LABEL, s.small);
     let samples = child(hwnd, w!("LISTBOX"), "", LBS_NOINTEGRALHEIGHT | WS_VSCROLL.0 | WS_HSCROLL.0 | tab, 0, ID_SAMPLES, s.font);
     dark_scrollbars(samples);
@@ -1375,7 +1427,7 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
         y += px(40);
     }
     if !s.folder && !details {
-        let ids = [ID_PLUGINS, ID_TAGS_LABEL, ID_TAGS, ID_SAVE, ID_NOTES, ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK];
+        let ids = [ID_PLUGINS, ID_TAGS_LABEL, ID_TAGS, ID_SAVE, ID_NOTES, ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH];
         for id in ids.into_iter().chain(ID_STATUS..ID_STATUS + 6).chain(ID_RATING..ID_RATING + 6) {
             place(hwnd, id, 0, 0, 0, 0, false);
         }
@@ -1398,8 +1450,9 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
         y += px(30);
         place(hwnd, ID_NOTES, m, y, w, px(52), true);
         y += px(60);
-        for (i, id) in [ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK].into_iter().enumerate() {
-            place(hwnd, id, m + i as i32 * (bw + gap), y, bw, px(26), true);
+        let bw7 = (w - 6 * gap) / 7;
+        for (i, id) in [ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH].into_iter().enumerate() {
+            place(hwnd, id, m + i as i32 * (bw7 + gap), y, bw7, px(26), true);
         }
         y += px(36);
     }
@@ -1440,6 +1493,7 @@ fn lit(s: &Song, id: i32) -> Option<u32> {
         _ if (ID_STATUS..ID_STATUS + 5).contains(&id) => (STATUSES[(id - ID_STATUS) as usize] == s.status).then_some(STATUS_COLORS[(id - ID_STATUS) as usize]),
         _ if (ID_RATING..ID_RATING + 5).contains(&id) => (s.rating == (id - ID_RATING + 1) as u32).then_some(rgb(255, 200, 60)),
         ID_BOOKMARK => s.bookmark.then_some(C_ACCENT),
+        ID_FETCH => (!s.plugins_missing.is_empty()).then_some(C_RED),
         ID_BOOKMARKS => s.want_bookmarks.then_some(C_ACCENT),
         ID_LIBRARY => s.want_library.then_some(C_ACCENT),
         ID_AUTOSHOW => s.autoshow.then_some(rgb(80, 205, 120)),
@@ -1543,6 +1597,7 @@ unsafe fn command(hwnd: HWND, s: &mut Song, id: i32, code: u32) {
             }
         }
         ID_FIND => flctl(&["versions", &s.path]),
+        ID_FETCH => flctl(&["fetchplugins", &s.path]),
         ID_FOLDER => reveal(&s.path),
         _ => {}
     }

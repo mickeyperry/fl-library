@@ -373,9 +373,18 @@ impl Progress {
     }
 }
 
-fn stop_panel() {
+/// Stop the panel and any scanner / sync run that lives in the install folder (they keep
+/// python.exe locked). Returns whether a scan was interrupted, so it can be restarted afterwards.
+fn stop_running() -> bool {
     let _ = hidden(Command::new("taskkill").args(["/F", "/IM", "flpanel.exe"])).output();
-    std::thread::sleep(Duration::from_millis(400));
+    let dir = install_dir().to_string_lossy().replace('\'', "''");
+    let ps = format!(
+        "$k = Get-Process python,pythonw -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '{dir}\\*' }}; \
+         $k | Stop-Process -Force; [int]($k.Count -gt 0)"
+    );
+    let out = hidden(Command::new("powershell").args(["-NoProfile", "-Command", &ps])).output();
+    std::thread::sleep(Duration::from_millis(600));
+    out.map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1").unwrap_or(false)
 }
 
 fn fnv(data: &[u8]) -> u32 {
@@ -409,8 +418,8 @@ fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
     let pythonw = dir.join("python").join("pythonw.exe");
     let hklm = HKEY_LOCAL_MACHINE;
 
-    p.send(0.03, "Getting ready", "Stopping a running panel, if any");
-    stop_panel();
+    p.send(0.03, "Getting ready", "Stopping a running panel or scan, if any");
+    let interrupted = stop_running();
 
     // 1. files
     let mut zip = zip::ZipArchive::new(Cursor::new(PAYLOAD)).map_err(|e| format!("payload: {e}"))?;
@@ -575,7 +584,7 @@ fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
     start_unelevated(&panel);
-    if opts[2] {
+    if opts[2] || interrupted {
         p.send(0.97, "Starting the first scan", "It keeps running in the background");
         let _ = hidden(Command::new("schtasks").args(["/Run", "/TN", TASK])).output();
     }
@@ -588,7 +597,7 @@ fn uninstall(delete_library: bool, p: &Progress) -> std::result::Result<(), Stri
     let dir = install_dir();
     let hklm = HKEY_LOCAL_MACHINE;
     p.send(0.1, "Stopping FL Library", "");
-    stop_panel();
+    stop_running();
     let _ = hidden(Command::new("schtasks").args(["/Delete", "/F", "/TN", TASK])).output();
     let _ = hidden(Command::new("schtasks").args(["/Delete", "/F", "/TN", TASK_SYNC])).output();
 
