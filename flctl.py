@@ -576,6 +576,185 @@ def run_elevated_and_wait(exe, params):
     return True
 
 
+LICENSED_RE = None
+
+
+def licensed_note(path):
+    """Plugins that will not run from a copied file: they need their installer / licence."""
+    import re
+    global LICENSED_RE
+    if LICENSED_RE is None:
+        LICENSED_RE = re.compile(r'waveshell|\\waves\\|\\uad\b|uad |universal audio|native instruments|kontakt|massive|'
+                                 r'reaktor|guitar rig|izotope|ozone|nectar|spectrasonics|omnisphere|trilian|keyscape|'
+                                 r'stylus|atmosphere|fabfilter|slate|soundtoys|arturia|ilok|pace\b|antares|auto-tune|'
+                                 r'melodyne|celemony|xln|addictive|toontrack|superior drummer|ezdrummer|serum|xfer', re.I)
+    return bool(LICENSED_RE.search(path))
+
+
+FL_LEGACY_URL = 'https://forum.image-line.com/viewtopic.php?t=194258'  # "FL Studio Installer Archive" (login)
+FL_VER_RE = None
+
+
+def installer_version(path):
+    """Version number an FL installer file (or its folder) is named with, as a tuple, or None."""
+    import re
+    global FL_VER_RE
+    if FL_VER_RE is None:
+        FL_VER_RE = re.compile(r'(?:flstudio|fl[ _]?studio|fruity ?loops)[^0-9]{0,40}?(\d+(?:[._]\d+){0,3})', re.I)
+    for text in (os.path.basename(path), os.path.basename(os.path.dirname(path))):
+        text = re.sub(r'win64|win32|x64|x86|64bit|32bit', '', text, flags=re.I)
+        m = FL_VER_RE.search(text)
+        if m:
+            parts = tuple(int(x) for x in re.split(r'[._]', m.group(1)))
+            if 1 <= parts[0] <= 99:
+                return parts
+    return None
+
+
+def fl_installers(cfg, version):
+    """FL Studio installers on your drives, shares and other PCs, best match for `version` first:
+    [(path, version tuple, where)]."""
+    want = tuple(int(x) for x in version.split('.') if x.isdigit())
+    if not want:
+        return []
+    search = 'file: ext:exe;msi;zip;rar;7z;iso size:>20mb <flstudio|"fl studio"|fl_studio|fruityloops|"fruity loops">'
+    cands = []
+    for full, size in everything_hits(cfg['everything_url'], search, 400):
+        cands.append((full, size, 'network share' if full.startswith('\\\\') else 'this PC'))
+    for peer in cfg.get('peers') or []:
+        for full, size in everything_hits(peer['everything'], search, 400):
+            if full[1:3] == ':\\' and peer.get('share'):
+                cands.append((peer['share'].replace('{drive}', full[0]) + full[2:], size, peer['everything']))
+    scored, seen = [], set()
+    for full, size, where in cands:
+        ver = installer_version(full)
+        low = full.lower()
+        if not ver or ver[0] != want[0] or low in seen or '$recycle.bin' in low:
+            continue
+        seen.add(low)
+        match = 0
+        for a, b in zip(ver, want):
+            if a != b:
+                break
+            match += 1
+        score = (match, ver[:2] <= want[:2], low.endswith('.exe'), where == 'this PC', ver)
+        scored.append((score, full, ver, where))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [(full, ver, where) for _, full, ver, where in scored]
+
+
+def get_fl(flp):
+    """Find the installer of the FL version a project was made with and show it, or point at
+    Image-Line's legacy downloads."""
+    flp = os.path.abspath(flp)
+    cfg = scanner.load_config()
+    db = scanner.connect()
+    row = db.execute('SELECT p.version FROM files f JOIN projects p ON p.hash = f.hash '
+                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+    db.close()
+    version = (row[0] if row else '') or ''
+    if not version:
+        version = scanner.flparse.parse_file(flp).get('version') or ''
+    if not version:
+        ctypes.windll.user32.MessageBoxW(None, 'This project does not say which FL version made it.', 'FL Library', 0x30)
+        return
+    found = fl_installers(cfg, version)
+    if found:
+        lines = [f"{'.'.join(map(str, v))}   {p}" + ('' if w == 'this PC' else f'   ({w})') for p, v, w in found[:8]]
+        text = (f'Project made with FL Studio {version}.\n\nInstallers found (closest first):\n\n' + '\n'.join(lines)
+                + '\n\nShow the first one in Explorer?')
+        if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - get FL ' + version, 0x24) == 6:
+            subprocess.Popen(['explorer.exe', '/select,' + found[0][0]])
+        return
+    text = (f'Project made with FL Studio {version}.\n\nNo FL {version.split(".")[0]} installer found on your drives, '
+            'shares or the other PCs.\n\nOpen Image-Line\'s "FL Studio Installer Archive" forum thread '
+            '(versions 1-12 and samples; needs your Image-Line login)?')
+    if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - get FL ' + version, 0x24) == 6:
+        os.startfile(FL_LEGACY_URL)
+
+
+RELEASES_API = 'https://api.github.com/repos/mickeyperry/fl-library/releases/latest'
+RELEASES_PAGE = 'https://github.com/mickeyperry/fl-library/releases/latest'
+
+
+def installed_version():
+    import winreg
+    for view in (winreg.KEY_WOW64_64KEY, 0):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FLLibrary',
+                                0, winreg.KEY_READ | view) as k:
+                return winreg.QueryValueEx(k, 'DisplayVersion')[0]
+        except OSError:
+            continue
+    return None
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in str(v).lstrip('vV').split('.') if x.isdigit())
+
+
+def latest_release():
+    """(version, installer url) of the newest GitHub release, or None when offline."""
+    import urllib.request
+    req = urllib.request.Request(RELEASES_API, headers={'User-Agent': 'fl-library', 'Accept': 'application/vnd.github+json'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rel = json.load(r)
+    except (OSError, ValueError):
+        return None
+    url = next((a['browser_download_url'] for a in rel.get('assets', []) if a['name'].lower().endswith('.exe')), None)
+    return (rel.get('tag_name', '').lstrip('vV'), url) if url else None
+
+
+def update(check_only=False):
+    """Offer the newest release and install it. check_only: say nothing unless there is one, and
+    at most once a day (the panel runs this on startup and daily)."""
+    import tempfile
+    import urllib.request
+    db = scanner.connect()
+    if check_only:
+        row = db.execute("SELECT v FROM state WHERE k = 'update_checked'").fetchone()
+        if row and time.time() - float(row[0]) < 20 * 3600:
+            db.close()
+            return
+        db.execute("INSERT OR REPLACE INTO state VALUES('update_checked', ?)", (str(time.time()),))
+        db.commit()
+    db.close()
+    have = installed_version()
+    latest = latest_release()
+    if latest is None:
+        if not check_only:
+            ctypes.windll.user32.MessageBoxW(None, 'Could not reach GitHub to check for updates.', 'FL Library', 0x30)
+        return
+    ver, url = latest
+    if not have or version_tuple(ver) <= version_tuple(have):
+        if not check_only:
+            ctypes.windll.user32.MessageBoxW(None, f'FL Library {have} is the latest version.', 'FL Library', 0x40)
+        return
+    text = (f'FL Library {ver} is available (you have {have}).\n\nInstall it now? The panel restarts by itself; '
+            'Windows asks for permission once.')
+    if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library update', 0x24) != 6:
+        return
+    dest = os.path.join(tempfile.gettempdir(), 'FL-Library-Setup.exe')
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'fl-library'})
+        with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except OSError as e:
+        ctypes.windll.user32.MessageBoxW(None, f'Download failed:\n{e}\n\nGet it from\n{RELEASES_PAGE}', 'FL Library', 0x30)
+        return
+    # the installer stops this process (it runs from the install folder), so hand over and leave
+    if ctypes.windll.shell32.ShellExecuteW(None, 'runas', dest, '/silent /notify', None, 1) <= 32:
+        ctypes.windll.user32.MessageBoxW(None, f'Update not started. Run it yourself:\n{dest}', 'FL Library', 0x30)
+
+
+
+
 def nearest_existing_dir(path):
     d = os.path.dirname(path)
     while d and not os.path.isdir(d):
