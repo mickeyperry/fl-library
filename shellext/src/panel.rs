@@ -388,6 +388,7 @@ struct Song {
     samples: Vec<String>,
     sample_summary: String,
     plugins_missing: Vec<String>,
+    plugins_unchecked: bool, // indexed by an old scanner without plugin paths: not checked yet
     versions: Vec<Row>,
     inside: Vec<Row>,  // folder mode: projects under the folder
     results: Vec<Row>, // what the results table currently shows
@@ -605,8 +606,11 @@ fn load_project(s: &mut Song, file_name: &str) {
                 }).unwrap_or(false))
                 .filter_map(|p| p["name"].as_str().map(str::to_string))
                 .collect();
+            s.plugins_unchecked = items.iter().any(|p| p["vst"].as_bool() == Some(true) && p.get("path").is_none());
             if !names.is_empty() {
-                s.plugins = if s.plugins_missing.is_empty() {
+                s.plugins = if s.plugins_unchecked {
+                    format!("Plugins ({}){DOT}not checked yet (rescan pending){DOT}{}", names.len(), names.join(", "))
+                } else if s.plugins_missing.is_empty() {
                     format!("Plugins ({}): {}", names.len(), names.join(", "))
                 } else {
                     format!("Plugins ({}){DOT}{} MISSING: {}{DOT}{}", names.len(), s.plugins_missing.len(), s.plugins_missing.join(", "), names.join(", "))
@@ -684,6 +688,7 @@ fn load(path: &str) -> Song {
         samples: Vec::new(),
         sample_summary: "SAMPLES: not indexed yet (rescan runs every 30 min)".into(),
         plugins_missing: Vec::new(),
+        plugins_unchecked: false,
         versions: Vec::new(),
         inside: Vec::new(),
         results: Vec::new(),
@@ -1330,8 +1335,8 @@ unsafe fn build(hwnd: HWND, s: &Song) {
     button(hwnd, "All copies", ID_FIND, s.font);
     button(hwnd, "Folder", ID_FOLDER, s.font);
     button(hwnd, "\u{2605} Bookmark", ID_BOOKMARK, s.font);
-    let fetch = button(hwnd, "Fetch plugins", ID_FETCH, s.font);
-    if s.plugins_missing.is_empty() {
+    let fetch = button(hwnd, if s.plugins_unchecked { "Check plugins" } else { "Fetch plugins" }, ID_FETCH, s.font);
+    if s.plugins_missing.is_empty() && !s.plugins_unchecked {
         let _ = EnableWindow(fetch, false);
     }
     let short: String = s.version.split('.').take(2).collect::<Vec<_>>().join(".");
@@ -1538,7 +1543,7 @@ fn lit(s: &Song, id: i32) -> Option<u32> {
         _ if (ID_STATUS..ID_STATUS + 5).contains(&id) => (STATUSES[(id - ID_STATUS) as usize] == s.status).then_some(STATUS_COLORS[(id - ID_STATUS) as usize]),
         _ if (ID_RATING..ID_RATING + 5).contains(&id) => (s.rating == (id - ID_RATING + 1) as u32).then_some(rgb(255, 200, 60)),
         ID_BOOKMARK => s.bookmark.then_some(C_ACCENT),
-        ID_FETCH => (!s.plugins_missing.is_empty()).then_some(C_RED),
+        ID_FETCH => (!s.plugins_missing.is_empty()).then_some(C_RED).or(s.plugins_unchecked.then_some(rgb(255, 200, 60))),
         ID_BOOKMARKS => s.want_bookmarks.then_some(C_ACCENT),
         ID_LIBRARY => s.want_library.then_some(C_ACCENT),
         ID_AUTOSHOW => s.autoshow.then_some(rgb(80, 205, 120)),

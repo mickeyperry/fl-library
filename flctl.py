@@ -196,8 +196,15 @@ def project_plugins(db, flp):
                      'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
     plugins = json.loads(row[0]) if row and row[0] else []
     if not plugins or not any('path' in p for p in plugins):
-        info = scanner.flparse.parse_file(flp)  # not indexed yet (or indexed before paths were stored)
-        plugins = info['plugins']
+        # not indexed yet, or indexed before plugin paths were stored: parse it now and store the
+        # result so the panel shows the check from here on
+        try:
+            scanner.index_one(db, flp)
+            row = db.execute('SELECT p.plugins FROM files f JOIN projects p ON p.hash = f.hash '
+                             'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+            plugins = json.loads(row[0]) if row and row[0] else []
+        except Exception:
+            plugins = scanner.flparse.parse_file(flp)['plugins']
     return [p for p in plugins if p.get('path')]
 
 
