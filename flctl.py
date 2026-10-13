@@ -345,7 +345,11 @@ def fetch_plugins(flp, elevated=False):
                 report.append(f'--  {name}: could not copy from {src} ({e})')
         if not done:
             inst = installer_candidates(cfg, name)
-            if inst:
+            if sources:
+                hosts = sorted({s.split('\\')[2] for s, _ in sources if s.startswith('\\\\')})
+                where = f"copies exist on {', '.join(hosts)} but it is offline right now" if hosts else 'the copies found could not be read'
+                report.append(f'XX  {name}: {where}\n      expected at {path}')
+            elif inst:
                 report.append(f'??  {name}: no copy found; installer candidates:\n      ' + '\n      '.join(inst))
             else:
                 report.append(f'XX  {name}: not found on any drive or PC\n      expected at {path}')
