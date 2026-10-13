@@ -424,7 +424,7 @@ def licensed_note(path):
     return bool(LICENSED_RE.search(path))
 
 
-FL_LEGACY_URL = 'https://support.image-line.com/action/knowledgebase?ans=631'
+FL_LEGACY_URL = 'https://forum.image-line.com/viewtopic.php?t=194258'  # "FL Studio Installer Archive" (login)
 FL_VER_RE = None
 
 
@@ -500,7 +500,8 @@ def get_fl(flp):
             subprocess.Popen(['explorer.exe', '/select,' + found[0][0]])
         return
     text = (f'Project made with FL Studio {version}.\n\nNo FL {version.split(".")[0]} installer found on your drives, '
-            'shares or the other PCs.\n\nOpen Image-Line\'s page on downloading older versions (customer archive)?')
+            'shares or the other PCs.\n\nOpen Image-Line\'s "FL Studio Installer Archive" forum thread '
+            '(versions 1-12 and samples; needs your Image-Line login)?')
     if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - get FL ' + version, 0x24) == 6:
         os.startfile(FL_LEGACY_URL)
 
