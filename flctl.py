@@ -417,6 +417,15 @@ def copy_plugin(src, dest, progress=None):
     return note
 
 
+def trace(msg):
+    """Append a timestamped line to fetch.log next to the library (what the fetch did, for support)."""
+    try:
+        with open(os.path.join(scanner.DATA_DIR, 'fetch.log'), 'a', encoding='utf-8') as f:
+            f.write(f'{time.strftime("%H:%M:%S")} [{os.getpid()}] {msg}\n')
+    except OSError:
+        pass
+
+
 def copy_batch(cfg, db, batch, emit):
     """Copy each plugin from the best readable source; one event per step. batch: [(name, stored
     path, [(src, where)])]. Returns (ok count, report lines)."""
@@ -427,7 +436,9 @@ def copy_batch(cfg, db, batch, emit):
         for src, where in sources:
             if where == 'offline':
                 continue
+            trace(f'copy {name}: dest for {src}')
             dest = plugin_dest(cfg, src, path)
+            trace(f'copy {name}: {src} -> {dest}')
             emit(plugin=name, status='copying', detail=f'{src}  ->  {dest}')
             last = [0.0]
 
@@ -437,6 +448,7 @@ def copy_batch(cfg, db, batch, emit):
                     emit(plugin=name, status='copying', detail=f'{done_b / 2**20:,.0f} of {total_b / 2**20:,.0f} MB   {_src}  ->  {_dest}')
             try:
                 note = copy_plugin(src, dest, progress)
+                trace(f'copy {name}: done {note}')
                 db.execute('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
                            (os.path.basename(dest).lower(), dest, pe_machine(dest)))
                 db.commit()
@@ -449,6 +461,7 @@ def copy_batch(cfg, db, batch, emit):
                 done = True
                 break
             except OSError as e:
+                trace(f'copy {name}: failed {e}')
                 errors.append((src, e))
         if not done:
             unc = [(s, e) for s, e in errors if s.startswith('\\\\')]
@@ -485,10 +498,12 @@ def fetch_plugins(flp, json_out=False):
             ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - fetch plugins', flags)
 
     flp = os.path.abspath(flp)
+    trace(f'fetch: {flp}')
     cfg = scanner.load_config()
     db = scanner.connect()
     try:
         missing = missing_plugins(db, flp, cfg)
+        trace(f'fetch: missing {[n for n, _p, _l in missing]}')
     except Exception as e:
         emit(plugin='(check)', status='error', detail=str(e))
         emit(summary=f'Could not check the plugins: {e}')
@@ -523,6 +538,7 @@ def fetch_plugins(flp, json_out=False):
                 hosts = sorted({s.split('\\')[2] for s, _w in sources})
                 emit(plugin=name, status='offline', detail=f"copies exist on {', '.join(hosts)} but it is offline right now",
                      sources=[s for s, _w in sources[:20]])
+    trace('fetch: search done')
     plan = []
     for name, path, _l in missing:
         sources = found.get(name) or []
@@ -556,10 +572,13 @@ def fetch_plugins(flp, json_out=False):
 
 def can_write(directory):
     """Really try: os.access() says yes for Program Files although UAC says no."""
-    import tempfile
+    # not tempfile: on Windows it retries an access-denied folder 10,000 times before giving up
+    probe = os.path.join(nearest_existing_dir(os.path.join(directory, 'x')), f'.fl-library-write-test-{os.getpid()}')
     try:
-        with tempfile.TemporaryFile(dir=nearest_existing_dir(os.path.join(directory, 'x'))):
-            return True
+        with open(probe, 'x'):
+            pass
+        os.remove(probe)
+        return True
     except OSError:
         return False
 
@@ -572,8 +591,10 @@ def copy_plan(cfg, db, plan, emit):
     if not plan:
         return 0, []
     is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    trace(f'copy_plan: {len(plan)} plugin(s), admin={is_admin}')
     needs_admin = not is_admin and any(not can_write(os.path.dirname(plugin_dest(cfg, sources[0][0], path)))
                                        for _n, path, sources in plan)
+    trace(f'copy_plan: needs_admin={needs_admin}')
     if not needs_admin:
         return copy_batch(cfg, db, plan, emit)
     ok, report = 0, []
@@ -584,6 +605,7 @@ def copy_plan(cfg, db, plan, emit):
         json.dump(plan, f)
     out_file = plan_file + '.out'
     params = f'"{os.path.abspath(__file__)}" fetchplugins-copy "{plan_file}"'
+    trace(f'copy_plan: elevating: {sys.executable} {params}')
     seen = 0
 
     def relay():  # forward the elevated helper's events as they are written
@@ -630,14 +652,17 @@ def fetch_one(flp, name, src, json_out=True):
             sys.stdout.write(json.dumps(ev) + '\n')
             sys.stdout.flush()
 
+    trace(f'fetch_one: {name} from {src}')
     cfg = scanner.load_config()
     db = scanner.connect()
     path = next((p['path'] for p in project_plugins(db, os.path.abspath(flp)) if p['name'] == name), None)
+    trace(f'fetch_one: stored path {path}')
     if not path:
         emit(plugin=name, status='error', detail='plugin not found in the project')
         db.close()
         return
     if not os.path.exists(src):
+        trace('fetch_one: source not reachable')
         emit(plugin=name, status='offline' if src.startswith('\\\\') else 'error',
              detail=f'{src} is not reachable right now')
         db.close()
