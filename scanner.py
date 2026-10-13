@@ -43,6 +43,11 @@ DEFAULT_CONFIG = {
     # there maps to a share reachable from here ({drive} = the letter), e.g.
     # [{"everything": "http://<ip>:8666/", "share": "\\\\<ip>\\{drive}"}]
     'peers': [],
+    # where fetched plugins go on this PC (None = FL's usual folders under Program Files)
+    'vst_dir': None,      # 64-bit VST2 .dll
+    'vst_dir_x86': None,  # 32-bit VST2 .dll
+    'vst3_dir': None,     # .vst3
+    'vst_extra_dirs': [],  # other folders FL is set to scan, if it misses them
 }
 
 META_COLS = ('status', 'tags', 'rating', 'notes', 'bookmark', 'updated')
@@ -114,6 +119,7 @@ CREATE TABLE IF NOT EXISTS zipcache(path TEXT PRIMARY KEY, size INTEGER, mtime I
 CREATE TABLE IF NOT EXISTS meta(
   song_key TEXT PRIMARY KEY, status TEXT, tags TEXT, rating INTEGER, notes TEXT, updated INTEGER);
 CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS plugin_files(file TEXT PRIMARY KEY, path TEXT, machine INTEGER);
 """
 
 AUTOSAVE_RE = re.compile(r'\s*\((autosaved|overwritten)[^)]*\)\s*$', re.I)
@@ -168,6 +174,174 @@ def find_fl_exe(cfg):
         return cfg['fl_exe']
     hits = glob.glob(r'C:\Program Files\Image-Line\FL Studio*\FL64.exe')
     return max(hits, key=os.path.getmtime) if hits else None
+
+
+# ---------- plugins on this PC ----------
+
+PE_X64, PE_X86 = 0x8664, 0x14C
+
+
+def pe_machine(path):
+    """0x8664 (64-bit) / 0x14c (32-bit) / None."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+        pe = int.from_bytes(head[0x3C:0x40], 'little')
+        return int.from_bytes(head[pe + 4:pe + 6], 'little') if head[pe:pe + 4] == b'PE\0\0' else None
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def vst_dirs(cfg=None):
+    """The folders FL scans for VSTs on this PC: {'vst2_64': .., 'vst2_32': .., 'vst3': .., 'all': [..]}.
+    Standard Program Files locations plus whatever FL has in the registry, plus config overrides."""
+    cfg = cfg or {}
+    pf64 = os.environ.get('ProgramW6432') or os.environ.get('ProgramFiles', r'C:\Program Files')
+    pf32 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+    out = {
+        'vst2_64': cfg.get('vst_dir') or os.path.join(pf64, 'VstPlugins'),
+        'vst2_32': cfg.get('vst_dir_x86') or os.path.join(pf32, 'VstPlugins'),
+        'vst3': cfg.get('vst3_dir') or os.path.join(pf64, 'Common Files', 'VST3'),
+    }
+    dirs = [out['vst2_64'], out['vst2_32'], out['vst3'],
+            os.path.join(pf64, 'Steinberg', 'VstPlugins'), os.path.join(pf64, 'Common Files', 'VST2'),
+            os.path.join(pf32, 'Steinberg', 'VstPlugins'), os.path.join(pf32, 'Common Files', 'VST2'),
+            os.path.join(pf32, 'Common Files', 'VST3')]
+    dirs += list(cfg.get('vst_extra_dirs') or [])
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Image-Line\Shared\Plugins\FL Studio') as k:
+            for name in ('VstDir', 'VstDir64'):
+                try:
+                    dirs.append(winreg.QueryValueEx(k, name)[0])
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Image-Line') as root:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                if sub.startswith('FL Studio'):
+                    try:
+                        with winreg.OpenKey(root, sub + r'\General') as k:
+                            dirs.append(winreg.QueryValueEx(k, 'VST Plugins')[0])  # the "extra search folder"
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    seen, uniq = set(), []
+    for d in dirs:
+        d = os.path.normpath(d)
+        if d and d.lower() not in seen:
+            seen.add(d.lower())
+            uniq.append(d)
+    out['all'] = uniq
+    return out
+
+
+BITNESS_SUFFIX_RE = re.compile(r'[ _\-(]*(\.64|\.32|x64|x86|64bit|32bit|64|32)\)?$', re.I)
+
+
+def plugin_stem(file):
+    """'name.ext' with bitness suffixes dropped: x.64.dll, x_x64.dll, x (x64).dll and x.dll are the
+    same plugin to FL (it makes the .64 bridge stubs itself)."""
+    name, _dot, ext = file.lower().rpartition('.')
+    if not _dot:
+        return file.lower()
+    return BITNESS_SUFFIX_RE.sub('', name, count=1).rstrip(' _-') + '.' + ext
+
+
+def fl_own_plugin(path):
+    """FL's built-in plugins (old projects store them with a path too); FL always has those."""
+    low = path.lower()
+    return '\\image-line\\' in low or '\\plugins\\fruity\\' in low or ntpath.basename(low).startswith('fruity ')
+
+
+def fl_known_plugins():
+    """Plugin DLL paths FL's own plugin database lists as installed on this PC (lower-case)."""
+    paths = set()
+    base = os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Presets', 'Plugin database', 'Installed')
+    for root, _dirs, files in os.walk(base):
+        for f in files:
+            if f.lower().endswith('.nfo'):
+                try:
+                    for line in open(os.path.join(root, f), encoding='utf-8', errors='replace'):
+                        if line.startswith('ps_file_filename_'):
+                            paths.add(line.split('=', 1)[1].strip().lower())
+                except OSError:
+                    pass
+    return paths
+
+
+def referenced_plugin_files(db):
+    """Lower-case file names of every VST the indexed projects refer to."""
+    names = set()
+    for (pl,) in db.execute('SELECT plugins FROM projects WHERE plugins IS NOT NULL'):
+        try:
+            items = json.loads(pl)
+        except ValueError:
+            continue
+        for p in items:
+            path = p.get('path') if isinstance(p, dict) else None
+            if path and not fl_own_plugin(path):
+                base = ntpath.basename(path).lower()
+                names.add(base)
+                names.add(plugin_stem(base))  # the un-bridged original of a .64 stub
+    return names
+
+
+def local_plugin_hits(cfg, names, limit=2000):
+    """{file name: [(path, size)]} for copies of these plugin files on this PC's own drives (no shares)."""
+    out = {}
+    names = sorted(n for n in set(names) if n and '"' not in n)
+    for i in range(0, len(names), 40):
+        terms = '|'.join(f'wfn:"{n}"' for n in names[i:i + 40])
+        qs = urllib.parse.urlencode({'json': 1, 'path_column': 1, 'size_column': 1, 'count': limit,
+                                     'search': f'file: !"\\\\" <{terms}>'})
+        try:
+            with urllib.request.urlopen(cfg['everything_url'] + '?' + qs, timeout=20) as r:
+                res = json.load(r).get('results', [])
+        except (OSError, ValueError):
+            continue
+        for x in res:
+            full = x['path'] + '\\' + x['name']
+            low = full.lower()
+            if full.startswith('\\\\') or '$recycle.bin' in low or '\\temp\\' in low or '\\$' in low:
+                continue
+            out.setdefault(x['name'].lower(), []).append((full, int(x.get('size') or 0)))
+    return out
+
+
+def in_vst_dirs(path, dirs):
+    low = path.lower()
+    return any(low.startswith(d.lower().rstrip('\\') + '\\') for d in dirs)
+
+
+def refresh_plugin_files(db, cfg):
+    """Rebuild plugin_files: which of the plugin files the projects use are installed on this PC
+    (present in one of FL's VST folders, or listed in FL's own plugin database). The panel reads it."""
+    names = referenced_plugin_files(db)
+    dirs = vst_dirs(cfg)['all']
+    known = fl_known_plugins()
+    rows = {}
+    for path in known:
+        rows[ntpath.basename(path)] = (path, None)
+    for name, hits in local_plugin_hits(cfg, names).items():
+        for full, _size in hits:
+            if in_vst_dirs(full, dirs) and name not in rows:
+                rows[name] = (full, pe_machine(full))
+    db.execute('DELETE FROM plugin_files')
+    db.executemany('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
+                   [(n, p, m) for n, (p, m) in rows.items()])
+    db.commit()
+    return len(rows)
 
 
 # ---------- Everything ----------
@@ -554,6 +728,10 @@ def scan(recheck=False):
             db.execute('UPDATE files SET song_key = ?, song_name = ?, is_autosave = ? WHERE path = ?',
                        (key, sname, int(autosave), path))
     reflag(db)
+    try:
+        refresh_plugin_files(db, cfg)
+    except Exception as e:  # never let the plugin check break a scan
+        progress(f'plugin check skipped: {e}')
     merged = sync_meta(db, cfg)
     if merged:
         progress(f'synced {merged} song(s) from other PCs')

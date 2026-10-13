@@ -22,11 +22,16 @@ list. It never moves or changes your project files.
     version the project was made with (the nearest installed one). Ctrl+double-click shows the file
     in the current Explorer window.
   - **Hide demos:** hides FL's own demo, template, tutorial and performance-mode projects.
-  - **Fetch plugins:** a project's plugin line shows which VSTs are missing on this PC. The button
-    finds each one through Everything (this PC's other drives, network shares, and other PCs listed
-    under `peers` in `config.json`), prefers the 64-bit copy, and copies it, with its support files,
-    to the exact path the project expects, so FL loads it without a rescan. Plugins that need their
-    installer get a list of installer candidates found on your drives instead.
+  - **Fetch plugins:** a project's plugin line shows which VSTs are not installed on this PC. A
+    plugin counts as installed when FL's plugin database lists it or a copy sits in one of FL's VST
+    folders (checked through Everything, so the path stored in the project, which came from whatever
+    PC saved it, does not matter). The button finds each missing one through Everything (this PC's
+    other drives and backups, network shares, and other PCs listed under `peers` in `config.json`),
+    prefers the 64-bit copy, and copies it, with its support files, into this PC's VST folder
+    (`Program Files\VstPlugins`, the `(x86)` one for 32-bit, `Common Files\VST3` for VST3; change
+    them with `vst_dir`, `vst_dir_x86`, `vst3_dir`). FL finds plugins by file name there, so the
+    project loads; the report says what was copied from where and what could not be found. Plugins
+    that need their installer get a list of installer candidates found on your drives instead.
   - **Colours:** each project folder gets its own colour.
 - **Explorer columns for `.flp` files:** FL version, BPM, status, rating, hours worked, missing
   samples and versions. Right-click a column header → More…
@@ -94,6 +99,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1     # uninstall.ps1 to remo
 | `pythonw` | which `pythonw.exe` to use; defaults to the first one on PATH |
 | `port` | port of the optional browser UI (`python server.py`) |
 | `peers` | other PCs to fetch missing plugins from: `[{"everything": "http://<ip>:8666/", "share": "\\\\<ip>\\{drive}"}]`. Each needs Everything's HTTP server reachable over the network (allow it through its firewall) and a share that maps its drive letters (`{drive}` is replaced by the letter). Network shares that this PC's Everything already indexes are searched without any setup. |
+| `vst_dir`, `vst_dir_x86`, `vst3_dir` | where fetched plugins are copied (64-bit VST2, 32-bit VST2, VST3). Default: FL's usual folders under Program Files. `vst_extra_dirs` lists other folders FL scans, so plugins there count as installed. |
 | `sync_dir` | a folder every PC can reach (NAS / shared folder). Tags, status, ratings, notes and bookmarks are shared through it: each PC writes its own `meta-<host>.json` there and merges the others', newest change wins. Set the same folder on every PC. |
 
 ## How it works

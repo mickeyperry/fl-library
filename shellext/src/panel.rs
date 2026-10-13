@@ -449,6 +449,20 @@ fn row_from(r: &[String]) -> Row {
     }
 }
 
+/// "name.ext" with bitness suffixes dropped from the name: `x.64.dll`, `x_x64.dll`, `x (x64).dll`
+/// and `x.dll` are the same plugin to FL (it makes the `.64` bridge stubs itself).
+fn plugin_stem(file: &str) -> String {
+    let (name, ext) = file.rsplit_once('.').unwrap_or((file, ""));
+    let mut n = name.trim().to_string();
+    for suffix in [".64", ".32", "_x64", "_x86", "-x64", "-x86", " x64", " x86", "(x64)", "(x86)", "x64", "x86", "64", "32"] {
+        if let Some(rest) = n.strip_suffix(suffix) {
+            n = rest.trim_end_matches([' ', '_', '-', '(']).to_string();
+            break;
+        }
+    }
+    format!("{n}.{ext}")
+}
+
 /// File names (lower-case) of every plugin FL's own plugin database lists as installed on this PC.
 fn fl_installed_files() -> &'static std::collections::HashSet<String> {
     static FILES: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
@@ -554,14 +568,24 @@ fn load_project(s: &mut Song, file_name: &str) {
 
         if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&r[3]) {
             let names: Vec<&str> = items.iter().filter_map(|p| p["name"].as_str()).collect();
-            // a VST whose DLL is neither where the project expects it nor known to FL's plugin
-            // database under that file name (local paths only: no UNC probing)
+            // a VST that is not installed on this PC. The path in the project is from whatever PC
+            // saved it, so only the file name counts: FL's plugin database, or the scanner's table
+            // of plugin files found in this PC's VST folders (plugin_files, refreshed every scan
+            // and after each fetch). FL's own plugins always exist.
             let installed = fl_installed_files();
+            let local: std::collections::HashSet<String> = query("SELECT file FROM plugin_files WHERE ?1 = ''", "")
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .collect();
             s.plugins_missing = items
                 .iter()
                 .filter(|p| p["path"].as_str().map(|q| {
-                    let file = q.rsplit(SEP).next().unwrap_or(q).to_lowercase();
-                    !q.starts_with("\\\\") && !std::path::Path::new(q).exists() && !installed.contains(&file)
+                    let low = q.to_lowercase();
+                    let file = low.rsplit(SEP).next().unwrap_or(&low).to_string();
+                    let stem = plugin_stem(&file);
+                    let fl_own = low.contains("\\image-line\\") || low.contains("\\plugins\\fruity\\") || file.starts_with("fruity ");
+                    !fl_own && !installed.contains(&file) && !local.contains(&file)
+                        && !installed.iter().chain(local.iter()).any(|k| plugin_stem(k) == stem)
                 }).unwrap_or(false))
                 .filter_map(|p| p["name"].as_str().map(str::to_string))
                 .collect();

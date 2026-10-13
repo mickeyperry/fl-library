@@ -169,18 +169,13 @@ def color_subfolders(root):
     return done, not already
 
 
-PE_X64, PE_X86 = 0x8664, 0x14C
+PE_X64, PE_X86 = scanner.PE_X64, scanner.PE_X86
+pe_machine = scanner.pe_machine
 
-
-def pe_machine(path):
-    """0x8664 (64-bit) / 0x14c (32-bit) / None."""
-    try:
-        with open(path, 'rb') as f:
-            head = f.read(4096)
-        pe = int.from_bytes(head[0x3C:0x40], 'little')
-        return int.from_bytes(head[pe + 4:pe + 6], 'little') if head[pe:pe + 4] == b'PE\0\0' else None
-    except (OSError, IndexError, ValueError):
-        return None
+# folder names that are just "a plugins folder", not a plugin's own folder
+GENERIC_PLUGIN_DIRS = {'vstplugins', 'vstplugins64', 'vst plugins', 'vst', 'vst2', 'vst3', 'plugins', 'steinberg',
+                       'common files', 'program files', 'program files (x86)', 'x64', 'x86', '64', '32', '64-bit',
+                       '32-bit', 'win64', 'win32', 'windows', 'vsts', 'bu', 'backup'}
 
 
 def everything_hits(url, search, limit=50):
@@ -196,73 +191,75 @@ def everything_hits(url, search, limit=50):
     return [(x['path'] + '\\' + x['name'], int(x.get('size') or 0)) for x in data.get('results', []) if x.get('path')]
 
 
-def fl_known_plugins():
-    """Plugin DLL paths FL's own plugin database lists as installed on this PC."""
-    paths = set()
-    base = os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Presets', 'Plugin database', 'Installed')
-    for root, _dirs, files in os.walk(base):
-        for f in files:
-            if f.lower().endswith('.nfo'):
-                try:
-                    for line in open(os.path.join(root, f), encoding='utf-8', errors='replace'):
-                        if line.startswith('ps_file_filename_'):
-                            paths.add(line.split('=', 1)[1].strip().lower())
-                except OSError:
-                    pass
-    return paths
-
-
-def missing_plugins(db, flp):
-    """VST plugins a project refers to whose DLL is not on this PC: [(name, stored path)]."""
+def project_plugins(db, flp):
     row = db.execute('SELECT p.plugins FROM files f JOIN projects p ON p.hash = f.hash '
                      'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
     plugins = json.loads(row[0]) if row and row[0] else []
     if not plugins or not any('path' in p for p in plugins):
         info = scanner.flparse.parse_file(flp)  # not indexed yet (or indexed before paths were stored)
         plugins = info['plugins']
-    known = None
+    return [p for p in plugins if p.get('path')]
+
+
+def missing_plugins(db, flp, cfg):
+    """VST plugins a project uses that are not installed on this PC.
+
+    The path stored in the project is from whatever PC saved it, so only the file name counts: a
+    plugin is present when FL's plugin database lists that file, or a copy sits in one of this PC's
+    VST folders (checked live through Everything). Returns [(name, stored path, local copies
+    elsewhere on this PC)]."""
+    plugins = [p for p in project_plugins(db, flp) if not scanner.fl_own_plugin(p['path'])]
+    if not plugins:
+        return []
+    dirs = scanner.vst_dirs(cfg)['all']
+    known = {os.path.basename(k) for k in scanner.fl_known_plugins()}
+    known |= {r[0] for r in db.execute('SELECT file FROM plugin_files')}
+    known_stems = {scanner.plugin_stem(k) for k in known}
+    bases = [os.path.basename(p['path']).lower() for p in plugins]
+    hits = scanner.local_plugin_hits(cfg, bases + [scanner.plugin_stem(b) for b in bases])
     out = []
-    for p in plugins:
-        path = p.get('path')
-        if not path or path.startswith('\\\\'):
+    for p, base in zip(plugins, bases):
+        stem = scanner.plugin_stem(base)
+        if base in known or stem in known_stems:
             continue
-        if os.path.exists(path):
+        local = hits.get(base, []) + [h for h in hits.get(stem, []) if stem != base]
+        if any(scanner.in_vst_dirs(full, dirs) for full, _ in local):
             continue
-        if known is None:
-            known = fl_known_plugins()
-            known_names = {os.path.basename(k) for k in known}
-        # FL finds a plugin by name after its own scan, so the same file in another plugin folder counts
-        if path.lower() in known or os.path.basename(path.lower()) in known_names:
-            continue
-        out.append((p['name'], path))
+        out.append((p['name'], p['path'], [full for full, _ in local]))
     return out
 
 
-def plugin_sources(cfg, name, path):
-    """Where a copy of this plugin's file can be fetched from, best first: [(source path, note)]."""
+def plugin_sources(cfg, name, path, local_copies=()):
+    """Where a copy of this plugin's file can be fetched from, best first: [(source path, where)]."""
     import re
     base = os.path.basename(path)
-    stem, ext = os.path.splitext(base)
-    cands = []
+    _stem, ext = os.path.splitext(base)
+    cands = [(full, os.path.getsize(full) if os.path.exists(full) else 0, 'this PC') for full in local_copies]
     here = cfg['everything_url']
-    for full, size in everything_hits(here, f'file: whole:"{base}"'):
-        cands.append((full, size, 'network share' if full.startswith('\\\\') else 'this PC'))
+    stem = scanner.plugin_stem(base)
+    search = f'file: <wfn:"{base}"|wfn:"{stem}">' if stem != base.lower() else f'file: wfn:"{base}"'
+    for full, size in everything_hits(here, search, 200):
+        if full.startswith('\\\\'):
+            cands.append((full, size, 'network share'))
+        elif not local_copies:
+            cands.append((full, size, 'this PC'))
     for peer in cfg.get('peers') or []:
-        for full, size in everything_hits(peer['everything'], f'file: whole:"{base}"'):
+        for full, size in everything_hits(peer['everything'], search, 200):
             if re.match(r'^[A-Za-z]:\\', full) and peer.get('share'):
                 unc = peer['share'].replace('{drive}', full[0]) + full[2:]
                 cands.append((unc, size, peer['everything']))
     want64 = ext.lower() in ('.dll', '.vst3')
-    scored = []
+    scored, seen = [], set()
     for full, size, where in cands:
         low = full.lower()
-        if low == path.lower() or '$recycle.bin' in low or '\\temp\\' in low:
+        if low in seen or '$recycle.bin' in low or '\\temp\\' in low:
             continue
+        seen.add(low)
         if size and size < 32 * 1024 and '.64.' in low:
             continue  # a 32->64-bit bridge stub, not the plugin
         score = 0
         if low.endswith(os.path.dirname(path).lower().split('\\')[-1] + '\\' + base.lower()):
-            score += 3  # same folder name as the project expects
+            score += 3  # same folder name as the project had
         machine = pe_machine(full) if want64 else None
         if machine == PE_X64:
             score += 2
@@ -286,20 +283,56 @@ def installer_candidates(cfg, name):
     return [full for full, _ in hits if not full.lower().startswith('c:\\program files')][:3]
 
 
+def vst3_bundle(path):
+    """The .vst3 bundle folder containing this file, if it is packaged as one."""
+    d = os.path.dirname(path)
+    while d and os.path.dirname(d) != d:
+        if d.lower().endswith('.vst3') and os.path.isdir(d):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+
+def plugin_dest(cfg, src, stored_path):
+    """Where this copy belongs on this PC: FL's VST folder for its format and bitness, keeping the
+    plugin's own sub-folder name when it has one (support files sit next to the dll)."""
+    dirs = scanner.vst_dirs(cfg)
+    ext = os.path.splitext(src)[1].lower()
+    if ext == '.vst3' or vst3_bundle(src):
+        root = dirs['vst3']
+    elif pe_machine(src) == PE_X86:
+        root = dirs['vst2_32']
+    else:
+        root = dirs['vst2_64']
+    sub = ''
+    for cand in (os.path.basename(os.path.dirname(src)), os.path.basename(os.path.dirname(stored_path))):
+        if cand and cand.lower() not in GENERIC_PLUGIN_DIRS and not cand.lower().endswith('.vst3'):
+            sub = cand
+            break
+    bundle = vst3_bundle(src)
+    if bundle:
+        return os.path.join(root, os.path.basename(bundle))
+    return os.path.join(root, sub, os.path.basename(src)) if sub else os.path.join(root, os.path.basename(src))
+
+
 def copy_plugin(src, dest):
-    """Copy the plugin file to where the project expects it, plus the support files next to it."""
+    """Copy the plugin to its new home, plus the support files that live next to it."""
     import shutil
+    bundle = vst3_bundle(src)
+    if bundle:
+        shutil.copytree(bundle, dest, dirs_exist_ok=True)
+        return
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copy2(src, dest)
     sdir, ddir = os.path.dirname(src), os.path.dirname(dest)
     stem = os.path.splitext(os.path.basename(src))[0].lower()
-    folder_is_plugins = os.path.basename(sdir).lower() in ('vstplugins', 'vstplugins64', 'vst', 'vst2', 'vst3', 'plugins', 'steinberg')
+    folder_is_generic = os.path.basename(sdir).lower() in GENERIC_PLUGIN_DIRS
     for entry in os.listdir(sdir):
         s = os.path.join(sdir, entry)
         if os.path.normcase(s) == os.path.normcase(src):
             continue
         same_stem = os.path.splitext(entry)[0].lower().startswith(stem)
-        if same_stem or not folder_is_plugins:  # a plugin in its own folder: bring the whole folder
+        if same_stem or not folder_is_generic:  # a plugin in its own folder: bring the whole folder
             d = os.path.join(ddir, entry)
             try:
                 if os.path.isdir(s):
@@ -311,51 +344,67 @@ def copy_plugin(src, dest):
 
 
 def fetch_plugins(flp, elevated=False):
-    """Find each missing plugin on your other PCs / drives and copy it to the path the project
-    expects, so FL loads it with no rescan. Re-runs itself elevated when Program Files is involved."""
+    """Find each plugin this project uses that is not installed here, on this PC's other drives,
+    network shares and the other PCs, and copy it into this PC's VST folder. Re-runs itself
+    elevated when that folder is under Program Files."""
     flp = os.path.abspath(flp)
     cfg = scanner.load_config()
     db = scanner.connect()
-    missing = missing_plugins(db, flp)
-    db.close()
+    missing = missing_plugins(db, flp, cfg)
     if not missing:
-        ctypes.windll.user32.MessageBoxW(None, 'All plugins this project uses are on this PC.', 'FL Library', 0x40)
+        db.close()
+        ctypes.windll.user32.MessageBoxW(None, 'All plugins this project uses are installed on this PC.', 'FL Library', 0x40)
         return
     plan = []
-    for name, path in missing:
-        sources = plugin_sources(cfg, name, path)
-        plan.append((name, path, sources))
-    needs_admin = any(not os.access(nearest_existing_dir(path), os.W_OK) for _n, path, srcs in plan if srcs)
+    for name, path, local in missing:
+        sources = plugin_sources(cfg, name, path, local)
+        dest = plugin_dest(cfg, sources[0][0], path) if sources else None
+        plan.append((name, path, sources, dest))
+    needs_admin = any(dest and not os.access(nearest_existing_dir(dest), os.W_OK) for _n, _p, _s, dest in plan)
     if needs_admin and not elevated:
+        db.close()
         params = f'"{os.path.abspath(__file__)}" fetchplugins-elevated "{flp}"'
         if ctypes.windll.shell32.ShellExecuteW(None, 'runas', sys.executable, params, None, 1) > 32:
             return
         ctypes.windll.user32.MessageBoxW(None, 'Admin permission is needed to copy into Program Files.', 'FL Library', 0x30)
         return
     report = []
-    for name, path, sources in plan:
+    for name, path, sources, dest in plan:
         done = False
+        errors = []
         for src, where in sources:
+            dest = plugin_dest(cfg, src, path)
             try:
-                copy_plugin(src, path)
-                report.append(f'OK  {name}\n      from {src}')
+                copy_plugin(src, dest)
+                db.execute('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
+                           (os.path.basename(dest).lower(), dest, pe_machine(dest)))
+                db.commit()
+                report.append(f'OK  {name}\n      -> {dest}\n      from {src}')
                 done = True
                 break
             except OSError as e:
-                report.append(f'--  {name}: could not copy from {src} ({e})')
+                errors.append((src, e))
         if not done:
             inst = installer_candidates(cfg, name)
             if sources:
-                hosts = sorted({s.split('\\')[2] for s, _ in sources if s.startswith('\\\\')})
-                where = f"copies exist on {', '.join(hosts)} but it is offline right now" if hosts else 'the copies found could not be read'
-                report.append(f'XX  {name}: {where}\n      expected at {path}')
+                offline = sorted({s.split('\\')[2] for s, e in errors if s.startswith('\\\\') and e.errno in (2, 53, 64, 67, 1231)})
+                if offline and len(offline) == len({s.split('\\')[2] for s, _ in errors if s.startswith('\\\\')}) \
+                        and all(s.startswith('\\\\') for s, _ in errors):
+                    report.append(f"XX  {name}: copies exist on {', '.join(offline)} but it is offline right now")
+                else:
+                    src, e = errors[0]
+                    report.append(f'XX  {name}: could not copy from {src} ({e})')
             elif inst:
                 report.append(f'??  {name}: no copy found; installer candidates:\n      ' + '\n      '.join(inst))
             else:
-                report.append(f'XX  {name}: not found on any drive or PC\n      expected at {path}')
+                report.append(f'XX  {name}: not found on any drive or PC  ({os.path.basename(path)})')
+    db.close()
     ok = sum(r.startswith('OK') for r in report)
-    text = f'{ok} of {len(plan)} missing plugin(s) copied.\n\n' + '\n'.join(report)
-    text += '\n\nPlugins that came with an installer (licensed / with data folders) may still need to be installed properly.'
+    text = f"{ok} of {len(plan)} missing plugin(s) copied into this PC's VST folders.\n\n" + '\n'.join(report)
+    if ok:
+        text += ('\n\nFL finds plugins by file name in its VST folders, so the project should load now. '
+                 'To see them in the browser too: Options > Manage plugins > Find more plugins.'
+                 '\nPlugins that came with an installer (licensed / with data folders) may still need to be installed properly.')
     ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - fetch plugins', 0x40 if ok == len(plan) else 0x30)
 
 

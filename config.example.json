@@ -6,5 +6,11 @@
   ],
   "port": 8777,
   "fl_exe": null,
-  "pythonw": null
+  "pythonw": null,
+  "sync_dir": null,
+  "peers": [],
+  "vst_dir": null,
+  "vst_dir_x86": null,
+  "vst3_dir": null,
+  "vst_extra_dirs": []
 }
