@@ -256,7 +256,7 @@ def plugin_sources(cfg, name, path, local_copies=()):
                 unc = peer['share'].replace('{drive}', full[0]) + full[2:]
                 cands.append((unc, size, peer['everything']))
     want64 = ext.lower() in ('.dll', '.vst3')
-    scored, seen = [], set()
+    scored, offline, seen = [], [], set()
     for full, size, where in cands:
         low = full.lower()
         if low in seen or '$recycle.bin' in low or '\\temp\\' in low:
@@ -264,21 +264,41 @@ def plugin_sources(cfg, name, path, local_copies=()):
         seen.add(low)
         if size and size < 32 * 1024 and '.64.' in low:
             continue  # a 32->64-bit bridge stub, not the plugin
+        if full.startswith('\\\\') and not host_alive(full.split('\\')[2]):
+            offline.append((full, 'offline'))  # listed, never opened: an offline host costs seconds per file
+            continue
         score = 0
         if low.endswith(os.path.dirname(path).lower().split('\\')[-1] + '\\' + base.lower()):
             score += 3  # same folder name as the project had
         if '\\program files' in low and '\\bu\\' not in low and 'backup' not in low and '\\old ' not in low:
             score += 2  # a real install, not a backup copy
-        machine = pe_machine(full) if want64 else None
-        if machine == PE_X64:
-            score += 2
-        elif machine == PE_X86:
-            score += 1
         if where == 'this PC':
             score += 1
         scored.append((score, full, where))
     scored.sort(key=lambda t: -t[0])
-    return [(full, where) for _, full, where in scored]
+    if want64:  # bitness needs the file opened: only for the few that are in the running
+        top = []
+        for score, full, where in scored[:6]:
+            machine = pe_machine(full)
+            top.append((score + (2 if machine == PE_X64 else 1 if machine == PE_X86 else 0), full, where))
+        top.sort(key=lambda t: -t[0])
+        scored = top + scored[6:]
+    return [(full, where) for _, full, where in scored] + offline
+
+
+_HOSTS = {}
+
+
+def host_alive(host, timeout=0.8):
+    """Is this file server answering? Cached per run; a dead host would stall every file open."""
+    import socket
+    if host not in _HOSTS:
+        try:
+            socket.create_connection((host, 445), timeout=timeout).close()
+            _HOSTS[host] = True
+        except OSError:
+            _HOSTS[host] = False
+    return _HOSTS[host]
 
 
 def installer_candidates(cfg, name):
@@ -324,32 +344,77 @@ def plugin_dest(cfg, src, stored_path):
     return os.path.join(root, sub, os.path.basename(src)) if sub else os.path.join(root, os.path.basename(src))
 
 
-def copy_plugin(src, dest):
-    """Copy the plugin to its new home, plus the support files that live next to it."""
-    import shutil
-    bundle = vst3_bundle(src)
-    if bundle:
-        shutil.copytree(bundle, dest, dirs_exist_ok=True)
-        return
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    shutil.copy2(src, dest)
-    sdir, ddir = os.path.dirname(src), os.path.dirname(dest)
-    stem = os.path.splitext(os.path.basename(src))[0].lower()
-    folder_is_generic = os.path.basename(sdir).lower() in GENERIC_PLUGIN_DIRS
-    for entry in os.listdir(sdir):
-        s = os.path.join(sdir, entry)
-        if os.path.normcase(s) == os.path.normcase(src):
-            continue
-        same_stem = os.path.splitext(entry)[0].lower().startswith(stem)
-        if same_stem or not folder_is_generic:  # a plugin in its own folder: bring the whole folder
-            d = os.path.join(ddir, entry)
+SUPPORT_LIMIT = 1 << 30  # 1 GB: beyond this the folder is a sound library, not "support files"
+
+
+def tree_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
             try:
-                if os.path.isdir(s):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                elif not os.path.exists(d):
-                    shutil.copy2(s, d)
+                total += os.path.getsize(os.path.join(root, f))
             except OSError:
                 pass
+    return total
+
+
+def copy_plugin(src, dest, progress=None):
+    """Copy the plugin to its new home, plus the support files that live next to it. progress(done,
+    total) is called as bytes land. Returns a note when support files were skipped for size."""
+    import shutil
+    bundle = vst3_bundle(src)
+    files = []  # (source file, dest file)
+    if bundle:
+        for root, _dirs, names in os.walk(bundle):
+            for n in names:
+                s = os.path.join(root, n)
+                files.append((s, os.path.join(dest, os.path.relpath(s, bundle))))
+    else:
+        files.append((src, dest))
+        sdir, ddir = os.path.dirname(src), os.path.dirname(dest)
+        stem = os.path.splitext(os.path.basename(src))[0].lower()
+        folder_is_generic = os.path.basename(sdir).lower() in GENERIC_PLUGIN_DIRS
+        extras = []
+        for entry in os.listdir(sdir):
+            s = os.path.join(sdir, entry)
+            if os.path.normcase(s) == os.path.normcase(src):
+                continue
+            same_stem = os.path.splitext(entry)[0].lower().startswith(stem)
+            if same_stem or not folder_is_generic:  # a plugin in its own folder: bring the folder
+                extras.append((s, os.path.join(ddir, entry)))
+        files += [(s, d) for s, d in extras if os.path.isfile(s)]
+        for s, d in extras:
+            if os.path.isdir(s):
+                for root, _dirs, names in os.walk(s):
+                    for n in names:
+                        sf = os.path.join(root, n)
+                        files.append((sf, os.path.join(d, os.path.relpath(sf, s))))
+    sizes = []
+    for s, _d in files:
+        try:
+            sizes.append(os.path.getsize(s))
+        except OSError:
+            sizes.append(0)
+    total = sum(sizes)
+    note = ''
+    if total > SUPPORT_LIMIT and not bundle:
+        keep = [i for i, (s, _d) in enumerate(files) if os.path.normcase(s) == os.path.normcase(src)
+                or os.path.splitext(os.path.basename(s))[0].lower().startswith(os.path.splitext(os.path.basename(src))[0].lower())]
+        note = f'its folder is {total / 2**30:.1f} GB (a sound library?): only the plugin file was copied, install it properly for the rest'
+        files = [files[i] for i in keep]
+        total = sum(sizes[i] for i in keep)
+    done = 0
+    for s, d in files:
+        os.makedirs(os.path.dirname(d), exist_ok=True)
+        if os.path.normcase(s) == os.path.normcase(src) or not os.path.exists(d):
+            shutil.copy2(s, d)
+        try:
+            done += os.path.getsize(s)
+        except OSError:
+            pass
+        if progress:
+            progress(done, total)
+    return note
 
 
 def copy_batch(cfg, db, batch, emit):
@@ -358,18 +423,28 @@ def copy_batch(cfg, db, batch, emit):
     report, ok = [], 0
     for name, path, sources in batch:
         done, errors = False, []
-        for src, _where in sources:
+        offline_hosts = sorted({s.split('\\')[2] for s, w in sources if w == 'offline'})
+        for src, where in sources:
+            if where == 'offline':
+                continue
             dest = plugin_dest(cfg, src, path)
             emit(plugin=name, status='copying', detail=f'{src}  ->  {dest}')
+            last = [0.0]
+
+            def progress(done_b, total_b, _src=src, _dest=dest):
+                if total_b > 8 << 20 and time.time() - last[0] > 0.7:
+                    last[0] = time.time()
+                    emit(plugin=name, status='copying', detail=f'{done_b / 2**20:,.0f} of {total_b / 2**20:,.0f} MB   {_src}  ->  {_dest}')
             try:
-                copy_plugin(src, dest)
+                note = copy_plugin(src, dest, progress)
                 db.execute('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
                            (os.path.basename(dest).lower(), dest, pe_machine(dest)))
                 db.commit()
                 lic = licensed_note(src)
-                emit(plugin=name, status='licensed' if lic else 'ok', detail=f'{dest}   (from {src})')
+                emit(plugin=name, status='licensed' if lic else 'ok', detail=f'{dest}   (from {src})' + (f'   {note}' if note else ''))
                 report.append(f'OK  {name}\n      -> {dest}\n      from {src}'
-                              + ('\n      (licensed plugin: a copied file may not run, use its installer)' if lic else ''))
+                              + ('\n      (licensed plugin: a copied file may not run, use its installer)' if lic else '')
+                              + (f'\n      {note}' if note else ''))
                 ok += 1
                 done = True
                 break
@@ -377,8 +452,11 @@ def copy_batch(cfg, db, batch, emit):
                 errors.append((src, e))
         if not done:
             unc = [(s, e) for s, e in errors if s.startswith('\\\\')]
-            offline = sorted({s.split('\\')[2] for s, e in unc if e.errno in (2, 53, 64, 67, 1231)})
-            if errors and len(unc) == len(errors) and offline:
+            offline = sorted(set(offline_hosts) | {s.split('\\')[2] for s, e in unc if e.errno in (2, 53, 64, 67, 1231)})
+            if not errors and offline:
+                emit(plugin=name, status='offline', detail=f"copies exist on {', '.join(offline)} but it is offline right now")
+                report.append(f"XX  {name}: copies exist on {', '.join(offline)} but it is offline right now")
+            elif errors and len(unc) == len(errors) and offline:
                 emit(plugin=name, status='offline', detail=f"copies exist on {', '.join(offline)} but it is offline right now")
                 report.append(f"XX  {name}: copies exist on {', '.join(offline)} but it is offline right now")
             else:
@@ -423,15 +501,34 @@ def fetch_plugins(flp, json_out=False):
         db.close()
         return
     emit(plugins=[name for name, _p, _l in missing])
-    plan = []
-    for name, path, local in missing:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    for name, path, _l in missing:
         emit(plugin=name, status='searching', detail=os.path.basename(path))
-        sources = plugin_sources(cfg, name, path, local)
-        if sources:
-            emit(plugin=name, status='found', detail=f'{len(sources)} cop{"y" if len(sources) == 1 else "ies"}, best: {sources[0][0]}',
-                 sources=[s for s, _w in sources[:20]])
+    found = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:  # all plugins at once: the waits are network
+        futures = {pool.submit(plugin_sources, cfg, name, path, local): name for name, path, local in missing}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                sources = fut.result()
+            except Exception as e:
+                sources = []
+                emit(plugin=name, status='error', detail=f'search failed: {e}')
+            found[name] = sources
+            live = [s for s, w in sources if w != 'offline']
+            if live:
+                emit(plugin=name, status='found', detail=f'{len(live)} cop{"y" if len(live) == 1 else "ies"}, best: {live[0]}',
+                     sources=[s for s, _w in sources[:20]])
+            elif sources:
+                hosts = sorted({s.split('\\')[2] for s, _w in sources})
+                emit(plugin=name, status='offline', detail=f"copies exist on {', '.join(hosts)} but it is offline right now",
+                     sources=[s for s, _w in sources[:20]])
+    plan = []
+    for name, path, _l in missing:
+        sources = found.get(name) or []
+        if any(w != 'offline' for _s, w in sources):
             plan.append((name, path, sources))
-        else:
+        elif not sources:
             inst = installer_candidates(cfg, name)
             if inst:
                 emit(plugin=name, status='installer', detail='no copy on any drive or PC; installer: ' + inst[0])
@@ -487,17 +584,31 @@ def copy_plan(cfg, db, plan, emit):
         json.dump(plan, f)
     out_file = plan_file + '.out'
     params = f'"{os.path.abspath(__file__)}" fetchplugins-copy "{plan_file}"'
-    if run_elevated_and_wait(sys.executable, params):
+    seen = 0
+
+    def relay():  # forward the elevated helper's events as they are written
+        nonlocal seen, ok
         try:
-            for line in open(out_file, encoding='utf-8'):
-                ev = json.loads(line)
-                if 'plugin' in ev:
-                    emit(**ev)
-                    if ev['status'] in ('ok', 'licensed'):
-                        ok += 1
-                elif 'report' in ev:
-                    report.append(ev['report'])
+            with open(out_file, encoding='utf-8') as f:
+                lines = f.read().splitlines()
         except OSError:
+            return
+        for line in lines[seen:]:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                return  # half-written line: next poll
+            seen += 1
+            if 'plugin' in ev:
+                emit(**ev)
+                if ev['status'] in ('ok', 'licensed'):
+                    ok += 1
+            elif 'report' in ev:
+                report.append(ev['report'])
+
+    if run_elevated_and_wait(sys.executable, params, relay):
+        relay()
+        if seen == 0:
             for name, _p, _s in plan:
                 emit(plugin=name, status='error', detail='the elevated copy step did not report back')
     else:
@@ -552,8 +663,9 @@ def fetch_copy_elevated(plan_file):
     db.close()
 
 
-def run_elevated_and_wait(exe, params):
-    """Run exe elevated (UAC prompt) and wait for it. False if the prompt was refused."""
+def run_elevated_and_wait(exe, params, poll=None):
+    """Run exe elevated (UAC prompt) and wait for it, calling poll() twice a second meanwhile.
+    False if the prompt was refused."""
     import ctypes.wintypes as wt
 
     class SHELLEXECUTEINFOW(ctypes.Structure):
@@ -571,7 +683,9 @@ def run_elevated_and_wait(exe, params):
     info.nShow = 0
     if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
         return False
-    ctypes.windll.kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+    while ctypes.windll.kernel32.WaitForSingleObject(info.hProcess, 500) == 0x102:  # WAIT_TIMEOUT
+        if poll:
+            poll()
     ctypes.windll.kernel32.CloseHandle(info.hProcess)
     return True
 
