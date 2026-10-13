@@ -1561,9 +1561,11 @@ fn lit(s: &Song, id: i32) -> Option<u32> {
 }
 
 unsafe fn draw_button(s: &Song, di: &DrawItem) {
+    draw_button_raw(di, lit(s, di.ctl_id as i32));
+}
+
+unsafe fn draw_button_raw(di: &DrawItem, lit: Option<u32>) {
     let hdc = HDC(di.hdc);
-    let id = di.ctl_id as i32;
-    let lit = lit(s, id);
     let down = di.state & ODS_SELECTED != 0;
     let disabled = di.state & ODS_DISABLED != 0;
     let fill = lit.unwrap_or(if down { C_BTN_DOWN } else { C_BTN });
@@ -1865,12 +1867,26 @@ pub unsafe fn create(parent: HWND, rc: RECT, path: &str) -> HWND {
 const WM_FETCH_EVENT: u32 = WM_APP + 7;
 const ID_FETCH_LIST: i32 = 201;
 const ID_FETCH_SUMMARY: i32 = 202;
+const ID_FETCH_COPY: i32 = 203;
+const LVM_SETITEMSTATE: u32 = 0x102B;
+const LVM_GETITEMSTATE: u32 = 0x102C;
+const LVIS_STATEIMAGEMASK: u32 = 0xF000;
+const LVIS_CHECKED: u32 = 0x2000;
+const LVIS_UNCHECKED: u32 = 0x1000;
 
 struct FetchRow {
     plugin: String,
     status: String,
     detail: String,
-    sources: Vec<String>, // every copy found, best first (right-click to pick one)
+    sources: Vec<String>, // every copy found, best first
+    chosen: usize,        // which of them to copy from (right-click to change)
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum FetchPhase {
+    Searching,
+    Ready, // searched: tick rows, pick sources, press Copy selected
+    Copying,
 }
 
 struct FetchWin {
@@ -1880,7 +1896,21 @@ struct FetchWin {
     dpi: i32,
     flp: String,
     rows: Vec<FetchRow>,
+    phase: FetchPhase,
     done: bool,
+}
+
+unsafe fn lv_set_checked(lv: HWND, item: usize, checked: bool) {
+    let it = LvItem {
+        mask: 0, item: item as i32, sub: 0, state: if checked { LVIS_CHECKED } else { LVIS_UNCHECKED }, state_mask: LVIS_STATEIMAGEMASK,
+        text: std::ptr::null_mut(), cch: 0, image: 0, lparam: 0, indent: 0, group_id: 0, c_columns: 0,
+        pu_columns: std::ptr::null_mut(), pi_col_fmt: std::ptr::null_mut(), group: 0,
+    };
+    SendMessageW(lv, LVM_SETITEMSTATE, WPARAM(item), LPARAM(&it as *const LvItem as isize));
+}
+
+unsafe fn lv_is_checked(lv: HWND, item: usize) -> bool {
+    SendMessageW(lv, LVM_GETITEMSTATE, WPARAM(item), LPARAM(LVIS_STATEIMAGEMASK as isize)).0 as u32 & LVIS_STATEIMAGEMASK == LVIS_CHECKED
 }
 
 fn fetch_status_label(status: &str) -> String {
@@ -1924,7 +1954,7 @@ unsafe fn fetch_upsert(hwnd: HWND, st: &mut FetchWin, plugin: &str, status: &str
         }
         None => {
             let i = st.rows.len();
-            st.rows.push(FetchRow { plugin: plugin.to_string(), status: status.to_string(), detail: detail.to_string(), sources: Vec::new() });
+            st.rows.push(FetchRow { plugin: plugin.to_string(), status: status.to_string(), detail: detail.to_string(), sources: Vec::new(), chosen: 0 });
             set_cell(lv, i, 0, plugin, true);
             set_cell(lv, i, 1, &label, false);
             set_cell(lv, i, 2, detail, false);
@@ -1942,22 +1972,35 @@ unsafe fn fetch_event(hwnd: HWND, st: &mut FetchWin, ev: &serde_json::Value) {
         return;
     }
     if let Some(name) = ev["plugin"].as_str() {
-        fetch_upsert(hwnd, st, name, ev["status"].as_str().unwrap_or(""), ev["detail"].as_str().unwrap_or(""));
+        let status = ev["status"].as_str().unwrap_or("");
+        fetch_upsert(hwnd, st, name, status, ev["detail"].as_str().unwrap_or(""));
         if let Some(list) = ev["sources"].as_array() {
-            if let Some(row) = st.rows.iter_mut().find(|r| r.plugin == name) {
-                row.sources = list.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
+            if let Some(i) = st.rows.iter().position(|r| r.plugin == name) {
+                st.rows[i].sources = list.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
+                st.rows[i].chosen = 0;
+                if let Ok(lv) = GetDlgItem(hwnd, ID_FETCH_LIST) {
+                    lv_set_checked(lv, i, status == "found"); // ticked = will be copied
+                }
             }
         }
-        if !st.done {
+        if st.phase == FetchPhase::Copying {
             let copied = st.rows.iter().filter(|r| matches!(r.status.as_str(), "ok" | "licensed")).count();
-            let settled = st.rows.iter().filter(|r| matches!(r.status.as_str(), "ok" | "licensed" | "notfound" | "installer" | "offline" | "error")).count();
-            set_text(hwnd, ID_FETCH_SUMMARY, &format!("{copied} copied, {} to go\u{2026}", st.rows.len().saturating_sub(settled)));
+            let busy = st.rows.iter().filter(|r| matches!(r.status.as_str(), "waiting" | "copying" | "admin")).count();
+            set_text(hwnd, ID_FETCH_SUMMARY, &format!("{copied} copied, {busy} to go\u{2026}"));
         }
+        return;
+    }
+    if ev["searched"].as_bool() == Some(true) {
+        st.phase = FetchPhase::Ready;
+        set_text(hwnd, ID_FETCH_SUMMARY, ev["summary"].as_str().unwrap_or("Search done."));
+        fetch_update_button(hwnd, st);
         return;
     }
     if let Some(text) = ev["summary"].as_str() {
         st.done = true;
+        st.phase = FetchPhase::Ready;
         set_text(hwnd, ID_FETCH_SUMMARY, text);
+        fetch_update_button(hwnd, st);
         return;
     }
     if ev["none"].as_bool() == Some(true) {
@@ -1978,7 +2021,56 @@ unsafe fn fetch_layout(hwnd: HWND, dpi: i32) {
     let px = |v: i32| v * dpi / 96;
     let (m, w) = (px(12), rc.right - 2 * px(12));
     place(hwnd, ID_FETCH_SUMMARY, m, px(10), w, px(36), true);
-    place(hwnd, ID_FETCH_LIST, m, px(52), w, rc.bottom - px(52) - m, true);
+    let bh = px(30);
+    place(hwnd, ID_FETCH_LIST, m, px(52), w, rc.bottom - px(52) - bh - 2 * m, true);
+    place(hwnd, ID_FETCH_COPY, rc.right - m - px(220), rc.bottom - m - bh, px(220), bh, true);
+}
+
+/// Button text and enabled state follow the phase and the ticks.
+unsafe fn fetch_update_button(hwnd: HWND, st: &FetchWin) {
+    let Ok(b) = GetDlgItem(hwnd, ID_FETCH_COPY) else { return };
+    let (Ok(lv), FetchPhase::Ready) = (GetDlgItem(hwnd, ID_FETCH_LIST), st.phase) else {
+        let _ = SetWindowTextW(b, w!("Copy selected"));
+        let _ = EnableWindow(b, false);
+        return;
+    };
+    let n = (0..st.rows.len()).filter(|&i| lv_is_checked(lv, i) && !st.rows[i].sources.is_empty()).count();
+    let _ = SetWindowTextW(b, &HSTRING::from(format!("Copy selected ({n})")));
+    let _ = EnableWindow(b, n > 0);
+}
+
+/// Copy selected: the ticked rows, each from its chosen source, in one helper run (one UAC prompt).
+unsafe fn fetch_copy_selected(hwnd: HWND, st: &mut FetchWin) {
+    let Ok(lv) = GetDlgItem(hwnd, ID_FETCH_LIST) else { return };
+    let mut plan = Vec::new();
+    let mut picked = Vec::new();
+    for (i, r) in st.rows.iter().enumerate() {
+        if lv_is_checked(lv, i) && !r.sources.is_empty() {
+            plan.push(serde_json::json!({ "name": r.plugin, "src": r.sources[r.chosen.min(r.sources.len() - 1)] }));
+            picked.push(r.plugin.clone());
+        }
+    }
+    if plan.is_empty() {
+        return;
+    }
+    let file = std::env::temp_dir().join(format!("fl-library-plan-{}.json", std::process::id()));
+    if std::fs::write(&file, serde_json::to_string(&plan).unwrap_or_default()).is_err() {
+        set_text(hwnd, ID_FETCH_SUMMARY, "Could not write the copy list to the temp folder.");
+        return;
+    }
+    st.phase = FetchPhase::Copying;
+    st.done = false;
+    for p in &picked {
+        fetch_upsert(hwnd, st, p, "waiting", "");
+    }
+    fetch_update_button(hwnd, st);
+    set_text(hwnd, ID_FETCH_SUMMARY, &format!("Copying {} plugin(s)\u{2026}", picked.len()));
+    let flp = st.flp.clone();
+    if !spawn_flctl_events(hwnd, &["fetchplugins-many", &flp, &file.to_string_lossy(), "--json"]) {
+        st.phase = FetchPhase::Ready;
+        set_text(hwnd, ID_FETCH_SUMMARY, "Could not start the fetch helper.");
+        fetch_update_button(hwnd, st);
+    }
 }
 
 /// Right-click / double-click on a row: pick which copy to fetch from.
@@ -1988,7 +2080,8 @@ unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
     if i < 0 {
         return;
     }
-    let Some(row) = st.rows.get(i as usize) else { return };
+    let i = i as usize;
+    let Some(row) = st.rows.get(i) else { return };
     let Ok(menu) = CreatePopupMenu() else { return };
     if row.sources.is_empty() {
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("No copy of this plugin was found"));
@@ -1996,7 +2089,8 @@ unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("Copy from\u{2026}"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         for (n, src) in row.sources.iter().enumerate() {
-            let _ = AppendMenuW(menu, MF_STRING, n + 1, &HSTRING::from(src.replace('&', "&&")));
+            let flags = if n == row.chosen { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, n + 1, &HSTRING::from(src.replace('&', "&&")));
         }
     }
     let mut pt = POINT::default();
@@ -2004,21 +2098,19 @@ unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
     let _ = SetForegroundWindow(hwnd);
     let pick = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None).0 as usize;
     let _ = DestroyMenu(menu);
-    if pick == 0 {
+    if pick == 0 || st.phase == FetchPhase::Copying {
         return;
     }
-    let (plugin, src, flp) = (row.plugin.clone(), row.sources[pick - 1].clone(), st.flp.clone());
-    st.done = false;
-    fetch_upsert(hwnd, st, &plugin, "copying", &src);
-    set_text(hwnd, ID_FETCH_SUMMARY, &format!("Copying {plugin}\u{2026}"));
-    if !spawn_flctl_events(hwnd, &["fetchplugins-one", &flp, &plugin, &src, "--json"]) {
-        fetch_upsert(hwnd, st, &plugin, "error", "could not start the fetch helper");
-    }
+    st.rows[i].chosen = pick - 1;
+    let (plugin, src) = (st.rows[i].plugin.clone(), st.rows[i].sources[pick - 1].clone());
+    fetch_upsert(hwnd, st, &plugin, "found", &format!("will copy from: {src}"));
+    lv_set_checked(lv, i, true);
+    fetch_update_button(hwnd, st);
 }
 
 /// Start flctl in the background and feed its JSON lines to the window.
 unsafe fn spawn_fetch(hwnd: HWND, flp: &str) -> bool {
-    spawn_flctl_events(hwnd, &["fetchplugins", flp, "--json"])
+    spawn_flctl_events(hwnd, &["fetchplugins", flp, "--json", "--search-only"])
 }
 
 unsafe fn spawn_flctl_events(hwnd: HWND, args: &[&str]) -> bool {
@@ -2112,7 +2204,18 @@ unsafe extern "system" fn fetch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             if (hdr.code == NM_RCLICK || hdr.code == NM_DBLCLK) && hdr.id as i32 == ID_FETCH_LIST {
                 let _ = catch_unwind(AssertUnwindSafe(|| fetch_pick_source(hwnd, &mut *st)));
             }
+            if hdr.code == LVN_ITEMCHANGED && hdr.id as i32 == ID_FETCH_LIST {
+                fetch_update_button(hwnd, &*st); // a tick changed
+            }
             LRESULT(0)
+        }
+        WM_COMMAND if !st.is_null() && (wp.0 & 0xFFFF) as i32 == ID_FETCH_COPY => {
+            let _ = catch_unwind(AssertUnwindSafe(|| fetch_copy_selected(hwnd, &mut *st)));
+            LRESULT(0)
+        }
+        WM_DRAWITEM if lp.0 != 0 => {
+            draw_button_raw(&*(lp.0 as *const DrawItem), None);
+            LRESULT(1)
         }
         WM_CTLCOLORSTATIC if !st.is_null() => {
             let hdc = HDC(wp.0 as *mut c_void);
@@ -2179,11 +2282,15 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
     );
     let font = CreateFontW(-px(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
     let bold = CreateFontW(-px(13), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
-    let st = Box::into_raw(Box::new(FetchWin { font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, flp: flp.to_string(), rows: Vec::new(), done: false }));
+    let st = Box::into_raw(Box::new(FetchWin {
+        font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, flp: flp.to_string(), rows: Vec::new(), phase: FetchPhase::Searching, done: false,
+    }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, st as isize);
     child(hwnd, w!("STATIC"), "Looking for the missing plugins\u{2026}", SS_NOPREFIX, 0, ID_FETCH_SUMMARY, bold);
     let lv = child(hwnd, w!("SysListView32"), "", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, ID_FETCH_LIST, font);
-    SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, WPARAM(0), LPARAM(0x20 | 0x10000));
+    SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, WPARAM(0), LPARAM(0x20 | 0x10000 | 0x4)); // full row, double buffer, checkboxes
+    let b = button(hwnd, "Copy selected", ID_FETCH_COPY, font);
+    let _ = EnableWindow(b, false);
     SendMessageW(lv, LVM_SETBKCOLOR, WPARAM(0), LPARAM(C_FIELD as isize));
     SendMessageW(lv, LVM_SETTEXTBKCOLOR, WPARAM(0), LPARAM(C_FIELD as isize));
     SendMessageW(lv, LVM_SETTEXTCOLOR, WPARAM(0), LPARAM(C_TEXT as isize));

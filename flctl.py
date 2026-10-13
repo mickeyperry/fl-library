@@ -479,7 +479,7 @@ def copy_batch(cfg, db, batch, emit):
     return ok, report
 
 
-def fetch_plugins(flp, json_out=False):
+def fetch_plugins(flp, json_out=False, search_only=False):
     """Find each plugin this project uses that is not installed here, on this PC's other drives,
     network shares and the other PCs, and copy it into this PC's VST folder.
 
@@ -550,6 +550,14 @@ def fetch_plugins(flp, json_out=False):
                 emit(plugin=name, status='installer', detail='no copy on any drive or PC; installer: ' + inst[0])
             else:
                 emit(plugin=name, status='notfound', detail=f'no copy of {os.path.basename(path)} on any drive or PC')
+    if search_only:  # the fetch window: the user picks what to copy, then fetchplugins-many
+        db.close()
+        n, k = len(missing), len(plan)
+        text = f'{k} of {n} missing plugin(s) found.'
+        text += (' Untick what you do not want, right-click a row to change its source, then Copy selected.' if k
+                 else ' Nothing to copy: no copy of them on any drive or PC that is on.')
+        emit(searched=True, found=k, total=n, summary=text)
+        return
     report = []
     for name, path, _l in missing:
         if not any(n == name for n, _p, _s in plan):
@@ -643,6 +651,42 @@ def copy_plan(cfg, db, plan, emit):
         except OSError:
             pass
     return ok, report
+
+
+def fetch_many(flp, plan_file, json_out=True):
+    """Copy the plugins the user ticked in the fetch window, each from the source they picked.
+    plan_file: JSON [{"name": .., "src": ..}, ..]."""
+    def emit(**ev):
+        if json_out:
+            sys.stdout.write(json.dumps(ev) + '\n')
+            sys.stdout.flush()
+
+    wanted = json.load(open(plan_file, encoding='utf-8'))
+    try:
+        os.remove(plan_file)
+    except OSError:
+        pass
+    trace(f'fetch_many: {[(w["name"], w["src"]) for w in wanted]}')
+    cfg = scanner.load_config()
+    db = scanner.connect()
+    stored = {p['name']: p['path'] for p in project_plugins(db, os.path.abspath(flp))}
+    plan = []
+    for w in wanted:
+        name, src = w['name'], w['src']
+        if name not in stored:
+            emit(plugin=name, status='error', detail='plugin not found in the project')
+        elif not os.path.exists(src):
+            emit(plugin=name, status='offline' if src.startswith('\\\\') else 'error', detail=f'{src} is not reachable right now')
+        else:
+            plan.append((name, stored[name], [(src, 'chosen')]))
+    ok, _report = copy_plan(cfg, db, plan, emit)
+    db.close()
+    text = f'{ok} of {len(wanted)} copied.'
+    if ok:
+        text += ' Now run Options > Manage plugins > Find more plugins in FL once, then reopen the project.'
+    if ok < len(wanted):
+        text += ' Right-click a failed row to pick another source and Copy selected again.'
+    emit(summary=text, ok=ok, total=len(wanted))
 
 
 def fetch_one(flp, name, src, json_out=True):
@@ -909,8 +953,11 @@ def main(argv):
     if cmd == 'colorfolders':
         color_subfolders(argv[1])
         return
-    if cmd == 'fetchplugins':  # fetchplugins <flp> [--json]
-        fetch_plugins(argv[1], json_out='--json' in argv[2:])
+    if cmd == 'fetchplugins':  # fetchplugins <flp> [--json] [--search-only]
+        fetch_plugins(argv[1], json_out='--json' in argv[2:], search_only='--search-only' in argv[2:])
+        return
+    if cmd == 'fetchplugins-many':  # fetchplugins-many <flp> <plan.json> [--json]
+        fetch_many(argv[1], argv[2], json_out='--json' in argv[3:])
         return
     if cmd == 'fetchplugins-copy':  # the elevated copy step
         fetch_copy_elevated(argv[1])
