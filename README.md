@@ -40,7 +40,9 @@ list. It never moves or changes your project files.
   samples and versions. Right-click a column header → More…
 - **Right-click menu** on `.flp` files: set status, rating, tags and notes, list samples, find all
   copies.
-- **Tray icon:** click to turn the panel on or off; right-click → Exit.
+- **Tray icon:** click to turn the panel on or off; right-click → Check for updates / Exit. The
+  panel also checks GitHub once a day and offers a newer release when there is one; the update
+  installs itself and restarts the panel.
 
 ## Requirements
 

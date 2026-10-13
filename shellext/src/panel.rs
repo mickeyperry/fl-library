@@ -846,7 +846,7 @@ fn search(text: &str) -> (String, Vec<Row>) {
 
 // ---------- actions ----------
 
-fn flctl(args: &[&str]) {
+pub fn flctl(args: &[&str]) {
     let (Some(py), Some(ctl)) = (reg_str(w!("Pythonw")), reg_str(w!("Ctl"))) else { return };
     let _ = Command::new(py).arg(ctl).args(args).creation_flags(0x0800_0000).spawn();
 }

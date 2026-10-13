@@ -1100,6 +1100,16 @@ fn main() -> Result<()> {
         let p = Progress(0);
         let r = if uninstalling { uninstall(false, &p) } else { install([true, true, false], &p) };
         log(&format!("silent result: {r:?}"));
+        if std::env::args().any(|a| a.eq_ignore_ascii_case("/notify")) {
+            // started by the panel's own "update" action: say how it went
+            let text = wide(&match &r {
+                Ok(()) => format!("FL Library updated to {VERSION}."),
+                Err(e) => format!("FL Library update failed:\n{e}\n\nLog: {}", log_path().display()),
+            });
+            unsafe {
+                MessageBoxW(None, PCWSTR(text.as_ptr()), w!("FL Library"), if r.is_ok() { MB_ICONINFORMATION | MB_OK } else { MB_ICONERROR | MB_OK });
+            }
+        }
         std::process::exit(if r.is_ok() { 0 } else { 1 });
     }
     unsafe {

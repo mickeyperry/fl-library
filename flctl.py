@@ -506,6 +506,86 @@ def get_fl(flp):
         os.startfile(FL_LEGACY_URL)
 
 
+RELEASES_API = 'https://api.github.com/repos/mickeyperry/fl-library/releases/latest'
+RELEASES_PAGE = 'https://github.com/mickeyperry/fl-library/releases/latest'
+
+
+def installed_version():
+    import winreg
+    for view in (winreg.KEY_WOW64_64KEY, 0):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FLLibrary',
+                                0, winreg.KEY_READ | view) as k:
+                return winreg.QueryValueEx(k, 'DisplayVersion')[0]
+        except OSError:
+            continue
+    return None
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in str(v).lstrip('vV').split('.') if x.isdigit())
+
+
+def latest_release():
+    """(version, installer url) of the newest GitHub release, or None when offline."""
+    import urllib.request
+    req = urllib.request.Request(RELEASES_API, headers={'User-Agent': 'fl-library', 'Accept': 'application/vnd.github+json'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rel = json.load(r)
+    except (OSError, ValueError):
+        return None
+    url = next((a['browser_download_url'] for a in rel.get('assets', []) if a['name'].lower().endswith('.exe')), None)
+    return (rel.get('tag_name', '').lstrip('vV'), url) if url else None
+
+
+def update(check_only=False):
+    """Offer the newest release and install it. check_only: say nothing unless there is one, and
+    at most once a day (the panel runs this on startup and daily)."""
+    import tempfile
+    import urllib.request
+    db = scanner.connect()
+    if check_only:
+        row = db.execute("SELECT v FROM state WHERE k = 'update_checked'").fetchone()
+        if row and time.time() - float(row[0]) < 20 * 3600:
+            db.close()
+            return
+        db.execute("INSERT OR REPLACE INTO state VALUES('update_checked', ?)", (str(time.time()),))
+        db.commit()
+    db.close()
+    have = installed_version()
+    latest = latest_release()
+    if latest is None:
+        if not check_only:
+            ctypes.windll.user32.MessageBoxW(None, 'Could not reach GitHub to check for updates.', 'FL Library', 0x30)
+        return
+    ver, url = latest
+    if not have or version_tuple(ver) <= version_tuple(have):
+        if not check_only:
+            ctypes.windll.user32.MessageBoxW(None, f'FL Library {have} is the latest version.', 'FL Library', 0x40)
+        return
+    text = (f'FL Library {ver} is available (you have {have}).\n\nInstall it now? The panel restarts by itself; '
+            'Windows asks for permission once.')
+    if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library update', 0x24) != 6:
+        return
+    dest = os.path.join(tempfile.gettempdir(), 'FL-Library-Setup.exe')
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'fl-library'})
+        with urllib.request.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except OSError as e:
+        ctypes.windll.user32.MessageBoxW(None, f'Download failed:\n{e}\n\nGet it from\n{RELEASES_PAGE}', 'FL Library', 0x30)
+        return
+    # the installer stops this process (it runs from the install folder), so hand over and leave
+    if ctypes.windll.shell32.ShellExecuteW(None, 'runas', dest, '/silent /notify', None, 1) <= 32:
+        ctypes.windll.user32.MessageBoxW(None, f'Update not started. Run it yourself:\n{dest}', 'FL Library', 0x30)
+
+
 def nearest_existing_dir(path):
     d = os.path.dirname(path)
     while d and not os.path.isdir(d):
@@ -526,6 +606,9 @@ def main(argv):
         return
     if cmd == 'getfl':
         get_fl(argv[1])
+        return
+    if cmd == 'update':  # update [check]
+        update(check_only=len(argv) > 1 and argv[1] == 'check')
         return
     if cmd == 'samples':
         show_samples(argv[1])

@@ -5,7 +5,7 @@ config.json
 *.log
 
 # build output / generated
-bin/
+/bin/
 icons/
 shellext/target/
 __pycache__/
