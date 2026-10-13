@@ -76,6 +76,7 @@ const ID_FOLDER: i32 = 133;
 const ID_OPEN_ORIG: i32 = 134;
 const ID_BOOKMARK: i32 = 135;
 const ID_FETCH: i32 = 136; // copy missing plugins from other PCs / drives
+const ID_GETFL: i32 = 137; // find the installer of the FL version the project was made with
 const ID_SAMPLES_LABEL: i32 = 140;
 const ID_SAMPLES: i32 = 141;
 const ID_VERSIONS_LABEL: i32 = 150;
@@ -464,9 +465,24 @@ fn plugin_stem(file: &str) -> String {
 }
 
 /// File names (lower-case) of every plugin FL's own plugin database lists as installed on this PC.
-fn fl_installed_files() -> &'static std::collections::HashSet<String> {
-    static FILES: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
-    FILES.get_or_init(|| {
+/// Re-read every few minutes, so plugins installed while the panel runs show up without a restart.
+fn fl_installed_files() -> std::sync::Arc<std::collections::HashSet<String>> {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Arc<std::collections::HashSet<String>>)>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, set)) = guard.as_ref() {
+        if at.elapsed() < Duration::from_secs(180) {
+            return set.clone();
+        }
+    }
+    let set = Arc::new(read_fl_installed_files());
+    *guard = Some((Instant::now(), set.clone()));
+    set
+}
+
+fn read_fl_installed_files() -> std::collections::HashSet<String> {
+    {
         let mut set = std::collections::HashSet::new();
         let Ok(profile) = std::env::var("USERPROFILE") else { return set };
         let base = std::path::PathBuf::from(profile).join("Documents\\Image-Line\\FL Studio\\Presets\\Plugin database\\Installed");
@@ -489,7 +505,7 @@ fn fl_installed_files() -> &'static std::collections::HashSet<String> {
             }
         }
         set
-    })
+    }
 }
 
 fn load_folder(s: &mut Song) {
@@ -1318,6 +1334,11 @@ unsafe fn build(hwnd: HWND, s: &Song) {
     if s.plugins_missing.is_empty() {
         let _ = EnableWindow(fetch, false);
     }
+    let short: String = s.version.split('.').take(2).collect::<Vec<_>>().join(".");
+    let getfl = button(hwnd, &if short.is_empty() { "Get FL".to_string() } else { format!("Get FL {short}") }, ID_GETFL, s.font);
+    if short.is_empty() {
+        let _ = EnableWindow(getfl, false);
+    }
     child(hwnd, w!("STATIC"), &s.sample_summary, SS_NOPREFIX | SS_ENDELLIPSIS, 0, ID_SAMPLES_LABEL, s.small);
     let samples = child(hwnd, w!("LISTBOX"), "", LBS_NOINTEGRALHEIGHT | WS_VSCROLL.0 | WS_HSCROLL.0 | tab, 0, ID_SAMPLES, s.font);
     dark_scrollbars(samples);
@@ -1451,7 +1472,7 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
         y += px(40);
     }
     if !s.folder && !details {
-        let ids = [ID_PLUGINS, ID_TAGS_LABEL, ID_TAGS, ID_SAVE, ID_NOTES, ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH];
+        let ids = [ID_PLUGINS, ID_TAGS_LABEL, ID_TAGS, ID_SAVE, ID_NOTES, ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH, ID_GETFL];
         for id in ids.into_iter().chain(ID_STATUS..ID_STATUS + 6).chain(ID_RATING..ID_RATING + 6) {
             place(hwnd, id, 0, 0, 0, 0, false);
         }
@@ -1474,9 +1495,9 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
         y += px(30);
         place(hwnd, ID_NOTES, m, y, w, px(52), true);
         y += px(60);
-        let bw7 = (w - 6 * gap) / 7;
-        for (i, id) in [ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH].into_iter().enumerate() {
-            place(hwnd, id, m + i as i32 * (bw7 + gap), y, bw7, px(26), true);
+        let bw8 = (w - 7 * gap) / 8;
+        for (i, id) in [ID_OPEN, ID_OPEN_ORIG, ID_GETFL, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH].into_iter().enumerate() {
+            place(hwnd, id, m + i as i32 * (bw8 + gap), y, bw8, px(26), true);
         }
         y += px(36);
     }
@@ -1622,6 +1643,7 @@ unsafe fn command(hwnd: HWND, s: &mut Song, id: i32, code: u32) {
         }
         ID_FIND => flctl(&["versions", &s.path]),
         ID_FETCH => flctl(&["fetchplugins", &s.path]),
+        ID_GETFL => flctl(&["getfl", &s.path]),
         ID_FOLDER => reveal(&s.path),
         _ => {}
     }

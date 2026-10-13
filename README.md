@@ -32,6 +32,9 @@ list. It never moves or changes your project files.
     them with `vst_dir`, `vst_dir_x86`, `vst3_dir`). FL finds plugins by file name there, so the
     project loads; the report says what was copied from where and what could not be found. Plugins
     that need their installer get a list of installer candidates found on your drives instead.
+  - **Get FL <version>:** finds the installer of the FL version the project was made with on your
+    drives, shares and other PCs (closest build first) and shows it in Explorer, or points you at
+    Image-Line's page on older versions when there is none.
   - **Colours:** each project folder gets its own colour.
 - **Explorer columns for `.flp` files:** FL version, BPM, status, rating, hours worked, missing
   samples and versions. Right-click a column header → More…
@@ -99,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1     # uninstall.ps1 to remo
 | `pythonw` | which `pythonw.exe` to use; defaults to the first one on PATH |
 | `port` | port of the optional browser UI (`python server.py`) |
 | `peers` | other PCs to fetch missing plugins from: `[{"everything": "http://<ip>:8666/", "share": "\\\\<ip>\\{drive}"}]`. Each needs Everything's HTTP server reachable over the network (allow it through its firewall) and a share that maps its drive letters (`{drive}` is replaced by the letter). Network shares that this PC's Everything already indexes are searched without any setup. |
-| `vst_dir`, `vst_dir_x86`, `vst3_dir` | where fetched plugins are copied (64-bit VST2, 32-bit VST2, VST3). Default: FL's usual folders under Program Files. `vst_extra_dirs` lists other folders FL scans, so plugins there count as installed. |
+| `vst_dir`, `vst_dir_x86`, `vst3_dir` | where fetched plugins are copied (64-bit VST2, 32-bit VST2, VST3). Default: FL's usual folders under Program Files. Folders where FL has already found plugins (its plugin database) count as VST folders automatically; `vst_extra_dirs` adds more. |
 | `sync_dir` | a folder every PC can reach (NAS / shared folder). Tags, status, ratings, notes and bookmarks are shared through it: each PC writes its own `meta-<host>.json` there and merges the others', newest change wins. Set the same folder on every PC. |
 
 ## How it works
@@ -121,3 +124,16 @@ a long search can never freeze Explorer. The column handler runs out of process 
 Everything stays on your machine. `library.db` (your index, tags, notes and bookmarks) and
 `config.json` are gitignored and never leave your PC. The panel only talks to Everything on
 `127.0.0.1`.
+
+Everything's HTTP server has no authentication. Opening its port to other PCs (for `peers`) lets
+anyone on that network list your file names, so only do it on a network you trust.
+
+## Good to know
+
+- Everything is required: with its HTTP server off, scans find nothing and the plugin check is
+  skipped (the last known state is kept).
+- Copying a plugin file does not license it. Waves, UAD, Native Instruments, iLok-protected and
+  similar plugins still need their installer; the fetch report marks those.
+- Shared data (`sync_dir`) resolves conflicts by newest change, so keep the PCs' clocks in sync.
+- The panel's project data refreshes with each scan (every 30 minutes, or right-click a project →
+  FL Library → **Rescan library now**).

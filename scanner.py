@@ -236,6 +236,11 @@ def vst_dirs(cfg=None):
                         pass
     except OSError:
         pass
+    # wherever FL has actually found plugins (its plugin database) is a search folder too, which
+    # covers custom folders like D:\VST without any setting
+    for path in fl_known_plugins():
+        if '%' not in path and re.match(r'^[a-z]:\\', path):
+            dirs.append(ntpath.dirname(path))
     seen, uniq = set(), []
     for d in dirs:
         d = os.path.normpath(d)
@@ -297,8 +302,9 @@ def referenced_plugin_files(db):
     return names
 
 
-def local_plugin_hits(cfg, names, limit=2000):
-    """{file name: [(path, size)]} for copies of these plugin files on this PC's own drives (no shares)."""
+def local_plugin_hits(cfg, names, limit=2000, strict=False):
+    """{file name: [(path, size)]} for copies of these plugin files on this PC's own drives (no shares).
+    With strict=True an unreachable Everything raises instead of returning less."""
     out = {}
     names = sorted(n for n in set(names) if n and '"' not in n)
     for i in range(0, len(names), 40):
@@ -309,6 +315,8 @@ def local_plugin_hits(cfg, names, limit=2000):
             with urllib.request.urlopen(cfg['everything_url'] + '?' + qs, timeout=20) as r:
                 res = json.load(r).get('results', [])
         except (OSError, ValueError):
+            if strict:
+                raise
             continue
         for x in res:
             full = x['path'] + '\\' + x['name']
@@ -333,7 +341,11 @@ def refresh_plugin_files(db, cfg):
     rows = {}
     for path in known:
         rows[ntpath.basename(path)] = (path, None)
-    for name, hits in local_plugin_hits(cfg, names).items():
+    try:
+        found = local_plugin_hits(cfg, names, strict=True)
+    except (OSError, ValueError):
+        return None  # Everything unreachable: keep the table as it is rather than shrink it
+    for name, hits in found.items():
         for full, _size in hits:
             if in_vst_dirs(full, dirs) and name not in rows:
                 rows[name] = (full, pe_machine(full))
@@ -729,7 +741,8 @@ def scan(recheck=False):
                        (key, sname, int(autosave), path))
     reflag(db)
     try:
-        refresh_plugin_files(db, cfg)
+        if refresh_plugin_files(db, cfg) is None:
+            progress('plugin check skipped: Everything not reachable')
     except Exception as e:  # never let the plugin check break a scan
         progress(f'plugin check skipped: {e}')
     merged = sync_meta(db, cfg)

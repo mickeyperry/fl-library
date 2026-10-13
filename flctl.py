@@ -379,7 +379,8 @@ def fetch_plugins(flp, elevated=False):
                 db.execute('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
                            (os.path.basename(dest).lower(), dest, pe_machine(dest)))
                 db.commit()
-                report.append(f'OK  {name}\n      -> {dest}\n      from {src}')
+                lic = '\n      (licensed plugin: a copied file may not run, use its installer)' if licensed_note(src) else ''
+                report.append(f'OK  {name}\n      -> {dest}\n      from {src}{lic}')
                 done = True
                 break
             except OSError as e:
@@ -408,6 +409,102 @@ def fetch_plugins(flp, elevated=False):
     ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - fetch plugins', 0x40 if ok == len(plan) else 0x30)
 
 
+LICENSED_RE = None
+
+
+def licensed_note(path):
+    """Plugins that will not run from a copied file: they need their installer / licence."""
+    import re
+    global LICENSED_RE
+    if LICENSED_RE is None:
+        LICENSED_RE = re.compile(r'waveshell|\\waves\\|\\uad\b|uad |universal audio|native instruments|kontakt|massive|'
+                                 r'reaktor|guitar rig|izotope|ozone|nectar|spectrasonics|omnisphere|trilian|keyscape|'
+                                 r'stylus|atmosphere|fabfilter|slate|soundtoys|arturia|ilok|pace\b|antares|auto-tune|'
+                                 r'melodyne|celemony|xln|addictive|toontrack|superior drummer|ezdrummer|serum|xfer', re.I)
+    return bool(LICENSED_RE.search(path))
+
+
+FL_LEGACY_URL = 'https://support.image-line.com/action/knowledgebase?ans=631'
+FL_VER_RE = None
+
+
+def installer_version(path):
+    """Version number an FL installer file (or its folder) is named with, as a tuple, or None."""
+    import re
+    global FL_VER_RE
+    if FL_VER_RE is None:
+        FL_VER_RE = re.compile(r'(?:flstudio|fl[ _]?studio|fruity ?loops)[^0-9]{0,40}?(\d+(?:[._]\d+){0,3})', re.I)
+    for text in (os.path.basename(path), os.path.basename(os.path.dirname(path))):
+        text = re.sub(r'win64|win32|x64|x86|64bit|32bit', '', text, flags=re.I)
+        m = FL_VER_RE.search(text)
+        if m:
+            parts = tuple(int(x) for x in re.split(r'[._]', m.group(1)))
+            if 1 <= parts[0] <= 99:
+                return parts
+    return None
+
+
+def fl_installers(cfg, version):
+    """FL Studio installers on your drives, shares and other PCs, best match for `version` first:
+    [(path, version tuple, where)]."""
+    want = tuple(int(x) for x in version.split('.') if x.isdigit())
+    if not want:
+        return []
+    search = 'file: ext:exe;msi;zip;rar;7z;iso size:>20mb <flstudio|"fl studio"|fl_studio|fruityloops|"fruity loops">'
+    cands = []
+    for full, size in everything_hits(cfg['everything_url'], search, 400):
+        cands.append((full, size, 'network share' if full.startswith('\\\\') else 'this PC'))
+    for peer in cfg.get('peers') or []:
+        for full, size in everything_hits(peer['everything'], search, 400):
+            if full[1:3] == ':\\' and peer.get('share'):
+                cands.append((peer['share'].replace('{drive}', full[0]) + full[2:], size, peer['everything']))
+    scored, seen = [], set()
+    for full, size, where in cands:
+        ver = installer_version(full)
+        low = full.lower()
+        if not ver or ver[0] != want[0] or low in seen or '$recycle.bin' in low:
+            continue
+        seen.add(low)
+        match = 0
+        for a, b in zip(ver, want):
+            if a != b:
+                break
+            match += 1
+        score = (match, ver[:2] <= want[:2], low.endswith('.exe'), where == 'this PC', ver)
+        scored.append((score, full, ver, where))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [(full, ver, where) for _, full, ver, where in scored]
+
+
+def get_fl(flp):
+    """Find the installer of the FL version a project was made with and show it, or point at
+    Image-Line's legacy downloads."""
+    flp = os.path.abspath(flp)
+    cfg = scanner.load_config()
+    db = scanner.connect()
+    row = db.execute('SELECT p.version FROM files f JOIN projects p ON p.hash = f.hash '
+                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+    db.close()
+    version = (row[0] if row else '') or ''
+    if not version:
+        version = scanner.flparse.parse_file(flp).get('version') or ''
+    if not version:
+        ctypes.windll.user32.MessageBoxW(None, 'This project does not say which FL version made it.', 'FL Library', 0x30)
+        return
+    found = fl_installers(cfg, version)
+    if found:
+        lines = [f"{'.'.join(map(str, v))}   {p}" + ('' if w == 'this PC' else f'   ({w})') for p, v, w in found[:8]]
+        text = (f'Project made with FL Studio {version}.\n\nInstallers found (closest first):\n\n' + '\n'.join(lines)
+                + '\n\nShow the first one in Explorer?')
+        if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - get FL ' + version, 0x24) == 6:
+            subprocess.Popen(['explorer.exe', '/select,' + found[0][0]])
+        return
+    text = (f'Project made with FL Studio {version}.\n\nNo FL {version.split(".")[0]} installer found on your drives, '
+            'shares or the other PCs.\n\nOpen Image-Line\'s page on downloading older versions (customer archive)?')
+    if ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - get FL ' + version, 0x24) == 6:
+        os.startfile(FL_LEGACY_URL)
+
+
 def nearest_existing_dir(path):
     d = os.path.dirname(path)
     while d and not os.path.isdir(d):
@@ -425,6 +522,9 @@ def main(argv):
         return
     if cmd in ('fetchplugins', 'fetchplugins-elevated'):
         fetch_plugins(argv[1], elevated=cmd.endswith('elevated'))
+        return
+    if cmd == 'getfl':
+        get_fl(argv[1])
         return
     if cmd == 'samples':
         show_samples(argv[1])
