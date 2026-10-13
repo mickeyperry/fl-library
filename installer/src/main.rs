@@ -444,6 +444,10 @@ fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // unchanged since the last install: leave it (it may be locked by Explorer or the panel)
+        if std::fs::read(&target).map(|old| old == data).unwrap_or(false) {
+            continue;
+        }
         std::fs::write(&target, &data).map_err(|e| format!("{}: {e}", target.display()))?;
         if i % 25 == 0 {
             p.send(0.05 + 0.55 * i as f32 / total as f32, "Copying files", &rel.to_string_lossy());
