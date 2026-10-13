@@ -32,6 +32,10 @@ list. It never moves or changes your project files.
     them with `vst_dir`, `vst_dir_x86`, `vst3_dir`). FL finds plugins by file name there, so the
     project loads; the report says what was copied from where and what could not be found. Plugins
     that need their installer get a list of installer candidates found on your drives instead.
+  - **Fetch samples:** for a project with missing or moved samples, finds each one, the song's own
+    FL project zips first (the most faithful copies), then the song's folders, then every drive,
+    share and other PC, and copies the ones you tick next to the `.flp`, where FL looks for them.
+    Same window as Fetch plugins: untick, right-click to pick another copy, Copy selected.
   - **Get FL <version>:** finds the installer of the FL version the project was made with on your
     drives, shares and other PCs (closest build first) and shows it in Explorer, or points you at
     Image-Line's page on older versions when there is none.

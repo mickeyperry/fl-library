@@ -938,6 +938,234 @@ def update(check_only=False):
 
 
 
+# ---------- samples ----------
+
+def project_samples(db, flp):
+    """[(stored path, status, found)] for the project's samples that FL will not find: missing, moved
+    (a copy elsewhere on this PC) or never checked and not at their path."""
+    row = db.execute('SELECT p.samples FROM files f JOIN projects p ON p.hash = f.hash '
+                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+    items = json.loads(row[0]) if row and row[0] else []
+    if not items:
+        items = [{'path': sp, 'status': 'unchecked', 'found': None} for sp in scanner.flparse.parse_file(flp)['samples']]
+    out = []
+    here = os.path.dirname(flp)
+    for it in items:
+        sp, st = it.get('path') or '', it.get('status')
+        if not sp or st in ('ok', 'inzip', 'factory'):
+            continue
+        name = os.path.basename(sp)
+        if st == 'unchecked' and (os.path.exists(scanner.expand_sample(sp)) or os.path.exists(os.path.join(here, name))):
+            continue
+        if os.path.exists(os.path.join(here, name)):
+            continue  # already fetched next to the project
+        out.append((sp, st or 'missing', it.get('found')))
+    return out
+
+
+def song_zips(db, flp):
+    """FL project zips that belong to this song or sit in its folder: the most relevant place for
+    its samples. Best first."""
+    here = os.path.dirname(flp).lower()
+    row = db.execute('SELECT song_key FROM files WHERE path = ? COLLATE NOCASE', (flp,)).fetchone()
+    zips = []
+    if row:
+        zips += [r[0] for r in db.execute('SELECT DISTINCT container FROM files WHERE song_key = ? AND container IS NOT NULL '
+                                          'ORDER BY mtime DESC', (row[0],))]
+    zips += [r[0] for r in db.execute('SELECT DISTINCT container FROM files WHERE container IS NOT NULL AND '
+                                      'substr(lower(container), 1, ?) = ? ORDER BY mtime DESC', (len(here), here))]
+    seen, out = set(), []
+    for z in zips:
+        if z.lower() in seen:
+            continue
+        seen.add(z.lower())
+        if z.startswith('\\\\') and not host_alive(z.split('\\')[2]):
+            continue
+        if os.path.exists(z):
+            out.append(z)
+    return out
+
+
+_ZIP_NAMES = {}
+
+
+def zip_members(zpath):
+    """{lower-case base name: member name} of a zip, cached."""
+    import zipfile
+    if zpath not in _ZIP_NAMES:
+        names = {}
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                for n in z.namelist():
+                    if not n.endswith('/'):
+                        names.setdefault(n.replace('\\', '/').rsplit('/', 1)[-1].lower(), n)
+        except (OSError, zipfile.BadZipFile):
+            pass
+        _ZIP_NAMES[zpath] = names
+    return _ZIP_NAMES[zpath]
+
+
+def sample_sources(cfg, flp, zips, stored, found):
+    """Where a copy of this sample can come from, best first: [(source, where)]. A source is a file
+    path or 'zip|<zip path>|<member>'."""
+    name = os.path.basename(stored)
+    low_name = name.lower()
+    orig_dir = os.path.basename(os.path.dirname(stored)).lower()
+    song_root = os.path.dirname(os.path.dirname(flp)).lower()
+    scored, offline, seen = [], [], set()
+    for rank, z in enumerate(zips):
+        member = zip_members(z).get(low_name)
+        if member:
+            scored.append((20 - min(rank, 9), f'zip|{z}|{member}', 'FL zip of this song'))
+    cands = []
+    if found:
+        cands.append((found, 'this PC', 5))
+    for full, _size in everything_hits(cfg['everything_url'], f'file: wfn:"{name}"', 300):
+        cands.append((full, 'network share' if full.startswith('\\\\') else 'this PC', 0))
+    for peer in cfg.get('peers') or []:
+        for full, _size in everything_hits(peer['everything'], f'file: wfn:"{name}"', 200):
+            if full[1:3] == ':\\' and peer.get('share'):
+                cands.append((peer['share'].replace('{drive}', full[0]) + full[2:], peer['everything'], 0))
+    for full, where, bonus in cands:
+        low = full.lower()
+        if low in seen or '$recycle.bin' in low:
+            continue
+        seen.add(low)
+        if full.startswith('\\\\') and not host_alive(full.split('\\')[2]):
+            offline.append((full, 'offline'))
+            continue
+        score = bonus
+        if low.startswith(song_root + '\\'):
+            score += 4  # inside the song's own folder tree
+        if os.path.basename(os.path.dirname(low)) == orig_dir:
+            score += 3  # same folder name as where the project had it
+        if where == 'this PC':
+            score += 1
+        if '\\image-line\\' in low or '\\fl studio' in low:
+            score += 1  # factory content, a clean copy
+        scored.append((score, full, where))
+    scored.sort(key=lambda t: -t[0])
+    return [(src, where) for _s, src, where in scored] + offline
+
+
+def source_label(src):
+    if src.startswith('zip|'):
+        _z, zpath, member = src.split('|', 2)
+        return f'{zpath}  ->  {member}'
+    return src
+
+
+def copy_sample(src, dest):
+    import shutil
+    import zipfile
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if src.startswith('zip|'):
+        _z, zpath, member = src.split('|', 2)
+        with zipfile.ZipFile(zpath) as z, z.open(member) as m, open(dest, 'wb') as out:
+            shutil.copyfileobj(m, out, 1 << 20)
+    else:
+        shutil.copy2(src, dest)
+
+
+def fetch_samples(flp, json_out=False, search_only=False):
+    """Find the project's missing samples (its own FL zips first, then its folders, then every
+    drive and PC) and copy them next to the .flp, where FL looks for them."""
+    def emit(**ev):
+        if json_out:
+            sys.stdout.write(json.dumps(ev) + '\n')
+            sys.stdout.flush()
+
+    flp = os.path.abspath(flp)
+    trace(f'samples: {flp}')
+    cfg = scanner.load_config()
+    db = scanner.connect()
+    try:
+        wanted = project_samples(db, flp)
+    except Exception as e:
+        emit(plugin='(check)', status='error', detail=str(e))
+        emit(summary=f'Could not read the sample list: {e}')
+        db.close()
+        return
+    if not wanted:
+        emit(none=True)
+        if not json_out:
+            ctypes.windll.user32.MessageBoxW(None, 'All samples of this project are where FL will find them.', 'FL Library', 0x40)
+        db.close()
+        return
+    names = [os.path.basename(sp) for sp, _st, _f in wanted]
+    emit(plugins=names)
+    zips = song_zips(db, flp)
+    trace(f'samples: {len(wanted)} wanted, {len(zips)} zips')
+    for n in names:
+        emit(plugin=n, status='searching', detail='')
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    found_n = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(sample_sources, cfg, flp, zips, sp, f): (os.path.basename(sp), sp) for sp, _st, f in wanted}
+        for fut in as_completed(futures):
+            n, sp = futures[fut]
+            try:
+                sources = fut.result()
+            except Exception as e:
+                emit(plugin=n, status='error', detail=f'search failed: {e}')
+                continue
+            live = [s for s, w in sources if w != 'offline']
+            if live:
+                found_n += 1
+                emit(plugin=n, status='found', detail=f'{len(live)} cop{"y" if len(live) == 1 else "ies"}, best: {source_label(live[0])}',
+                     sources=[s for s, _w in sources[:25]])
+            elif sources:
+                hosts = sorted({s.split('\\')[2] for s, _w in sources})
+                emit(plugin=n, status='offline', detail=f"copies exist on {', '.join(hosts)} but it is offline right now", sources=[s for s, _w in sources[:25]])
+            else:
+                emit(plugin=n, status='notfound', detail=f'no copy on any drive or PC   (was {sp})')
+    db.close()
+    trace('samples: search done')
+    text = f'{found_n} of {len(wanted)} missing sample(s) found.'
+    text += (' Untick what you do not want, right-click a row to change its source, then Copy selected.' if found_n
+             else ' Nothing to copy.')
+    if search_only or json_out:
+        emit(searched=True, found=found_n, total=len(wanted), summary=text)
+        return
+    ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - fetch samples', 0x40)
+
+
+def fetch_samples_many(flp, plan_file, json_out=True):
+    """Copy the ticked samples next to the .flp, each from the chosen source."""
+    def emit(**ev):
+        if json_out:
+            sys.stdout.write(json.dumps(ev) + '\n')
+            sys.stdout.flush()
+
+    wanted = json.load(open(plan_file, encoding='utf-8'))
+    try:
+        os.remove(plan_file)
+    except OSError:
+        pass
+    flp = os.path.abspath(flp)
+    here = os.path.dirname(flp)
+    trace(f'samples_many: {len(wanted)} into {here}')
+    ok = 0
+    for w in wanted:
+        name, src = w['name'], w['src']
+        dest = os.path.join(here, name)
+        emit(plugin=name, status='copying', detail=f'{source_label(src)}  ->  {dest}')
+        try:
+            copy_sample(src, dest)
+            ok += 1
+            emit(plugin=name, status='ok', detail=f'{dest}   (from {source_label(src)})')
+        except Exception as e:  # noqa: BLE001 - zip, network or disk, all reported the same way
+            trace(f'samples_many: {name} failed {e}')
+            emit(plugin=name, status='offline' if src.startswith('\\\\') and isinstance(e, OSError) and e.errno in (2, 53, 64, 67, 1231) else 'error',
+                 detail=f'could not copy from {source_label(src)}: {e}')
+    text = f'{ok} of {len(wanted)} copied next to the project.'
+    if ok:
+        text += ' FL looks there for missing samples; if it still asks, Locate one of them and it finds the rest.'
+    if ok < len(wanted):
+        text += ' Right-click a failed row to pick another source and Copy selected again.'
+    emit(summary=text, ok=ok, total=len(wanted))
+
+
 def nearest_existing_dir(path):
     d = os.path.dirname(path)
     while d and not os.path.isdir(d):
@@ -958,6 +1186,12 @@ def main(argv):
         return
     if cmd == 'fetchplugins-many':  # fetchplugins-many <flp> <plan.json> [--json]
         fetch_many(argv[1], argv[2], json_out='--json' in argv[3:])
+        return
+    if cmd == 'fetchsamples':  # fetchsamples <flp> [--json] [--search-only]
+        fetch_samples(argv[1], json_out='--json' in argv[2:], search_only='--search-only' in argv[2:])
+        return
+    if cmd == 'fetchsamples-many':  # fetchsamples-many <flp> <plan.json> [--json]
+        fetch_samples_many(argv[1], argv[2], json_out='--json' in argv[3:])
         return
     if cmd == 'fetchplugins-copy':  # the elevated copy step
         fetch_copy_elevated(argv[1])

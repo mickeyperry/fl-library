@@ -480,7 +480,7 @@ def expand_sample(sp):
     return os.path.expandvars(sp)
 
 
-def resolve_samples(samples, audio, zip_names):
+def resolve_samples(samples, audio, zip_names, directory=None):
     out, missing, moved = [], 0, 0
     if audio is None:  # single-file index from the Explorer menu; the next scan resolves them
         return [{'path': sp, 'status': 'unchecked', 'found': None} for sp in samples], 0, 0
@@ -490,6 +490,8 @@ def resolve_samples(samples, audio, zip_names):
         found = None
         if zip_names and name in zip_names:
             status = 'inzip'
+        elif directory and (directory.lower() + '\\' + name) in audio.paths:
+            status = 'ok'  # next to the project (fetched there, or kept there): FL looks there first
         elif (low.startswith(('%flstudiofactorydata%', '%flstudiodata%', '\\patches\\', 'patches\\'))
               or FACTORY_SAMPLE_RE.search(low)):
             status = 'factory'
@@ -578,7 +580,7 @@ def store(db, audio, path, container, kind, directory, name, size, mtime, h, inf
         if not row[0] or '"path"' not in row[0]:
             db.execute('UPDATE projects SET plugins = ? WHERE hash = ?', (json.dumps(info['plugins'], ensure_ascii=False), h))
     else:
-        samples, n_missing, n_moved = resolve_samples(info['samples'], audio, zip_names)
+        samples, n_missing, n_moved = resolve_samples(info['samples'], audio, zip_names, ntpath.dirname(container or path))
         ver = info['version'] or ''
         major = flparse._version_tuple(ver)[0] if ver else None
         db.execute(

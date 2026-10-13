@@ -77,6 +77,7 @@ const ID_OPEN_ORIG: i32 = 134;
 const ID_BOOKMARK: i32 = 135;
 const ID_FETCH: i32 = 136; // copy missing plugins from other PCs / drives
 const ID_GETFL: i32 = 137; // find the installer of the FL version the project was made with
+const ID_FETCHSAMPLES: i32 = 138; // copy missing samples next to the project
 const ID_SAMPLES_LABEL: i32 = 140;
 const ID_SAMPLES: i32 = 141;
 const ID_VERSIONS_LABEL: i32 = 150;
@@ -390,6 +391,7 @@ struct Song {
     sample_summary: String,
     plugins_missing: Vec<String>,
     plugins_unchecked: bool, // indexed by an old scanner without plugin paths: not checked yet
+    samples_fetchable: Vec<String>, // missing or moved samples (file names) that Fetch samples can bring next to the project
     versions: Vec<Row>,
     inside: Vec<Row>,  // folder mode: projects under the folder
     results: Vec<Row>, // what the results table currently shows
@@ -634,6 +636,9 @@ fn load_project(s: &mut Song, file_name: &str) {
                 let p = it["path"].as_str().unwrap_or("");
                 counts[order(st)] += 1;
                 let file = p.rsplit(SEP).next().unwrap_or(p);
+                if matches!(st, "missing" | "moved") {
+                    s.samples_fetchable.push(file.to_string());
+                }
                 let line = match it["found"].as_str() {
                     Some(found) => format!("[{st}] {file}   \u{2192}   {found}"),
                     None => format!("[{st}] {file}   \u{2014}   {p}"),
@@ -697,6 +702,7 @@ fn load(path: &str) -> Song {
         sample_summary: "SAMPLES: not indexed yet (rescan runs every 30 min)".into(),
         plugins_missing: Vec::new(),
         plugins_unchecked: false,
+        samples_fetchable: Vec::new(),
         versions: Vec::new(),
         inside: Vec::new(),
         results: Vec::new(),
@@ -1347,6 +1353,10 @@ unsafe fn build(hwnd: HWND, s: &Song) {
     if s.plugins_missing.is_empty() && !s.plugins_unchecked {
         let _ = EnableWindow(fetch, false);
     }
+    let fs = button(hwnd, "Fetch samples", ID_FETCHSAMPLES, s.font);
+    if s.samples_fetchable.is_empty() {
+        let _ = EnableWindow(fs, false);
+    }
     let short: String = s.version.split('.').take(2).collect::<Vec<_>>().join(".");
     let getfl = button(hwnd, &if short.is_empty() { "Get FL".to_string() } else { format!("Get FL {short}") }, ID_GETFL, s.font);
     if short.is_empty() {
@@ -1485,7 +1495,7 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
         y += px(40);
     }
     if !s.folder && !details {
-        let ids = [ID_PLUGINS, ID_TAGS_LABEL, ID_TAGS, ID_SAVE, ID_NOTES, ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH, ID_GETFL];
+        let ids = [ID_PLUGINS, ID_TAGS_LABEL, ID_TAGS, ID_SAVE, ID_NOTES, ID_OPEN, ID_OPEN_ORIG, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH, ID_GETFL, ID_FETCHSAMPLES];
         for id in ids.into_iter().chain(ID_STATUS..ID_STATUS + 6).chain(ID_RATING..ID_RATING + 6) {
             place(hwnd, id, 0, 0, 0, 0, false);
         }
@@ -1508,9 +1518,9 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
         y += px(30);
         place(hwnd, ID_NOTES, m, y, w, px(52), true);
         y += px(60);
-        let bw8 = (w - 7 * gap) / 8;
-        for (i, id) in [ID_OPEN, ID_OPEN_ORIG, ID_GETFL, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH].into_iter().enumerate() {
-            place(hwnd, id, m + i as i32 * (bw8 + gap), y, bw8, px(26), true);
+        let bw9 = (w - 8 * gap) / 9;
+        for (i, id) in [ID_OPEN, ID_OPEN_ORIG, ID_GETFL, ID_PLAY, ID_FIND, ID_FOLDER, ID_BOOKMARK, ID_FETCH, ID_FETCHSAMPLES].into_iter().enumerate() {
+            place(hwnd, id, m + i as i32 * (bw9 + gap), y, bw9, px(26), true);
         }
         y += px(36);
     }
@@ -1552,6 +1562,7 @@ fn lit(s: &Song, id: i32) -> Option<u32> {
         _ if (ID_RATING..ID_RATING + 5).contains(&id) => (s.rating == (id - ID_RATING + 1) as u32).then_some(rgb(255, 200, 60)),
         ID_BOOKMARK => s.bookmark.then_some(C_ACCENT),
         ID_FETCH => (!s.plugins_missing.is_empty()).then_some(C_RED).or(s.plugins_unchecked.then_some(rgb(255, 200, 60))),
+        ID_FETCHSAMPLES => (!s.samples_fetchable.is_empty()).then_some(C_RED),
         ID_BOOKMARKS => s.want_bookmarks.then_some(C_ACCENT),
         ID_LIBRARY => s.want_library.then_some(C_ACCENT),
         ID_AUTOSHOW => s.autoshow.then_some(rgb(80, 205, 120)),
@@ -1657,7 +1668,8 @@ unsafe fn command(hwnd: HWND, s: &mut Song, id: i32, code: u32) {
             }
         }
         ID_FIND => flctl(&["versions", &s.path]),
-        ID_FETCH => open_fetch_window(&s.path, &s.plugins_missing, s.dpi),
+        ID_FETCH => open_fetch_window(&s.path, &s.plugins_missing, s.dpi, "plugins"),
+        ID_FETCHSAMPLES => open_fetch_window(&s.path, &s.samples_fetchable, s.dpi, "samples"),
         ID_GETFL => flctl(&["getfl", &s.path]),
         ID_FOLDER => reveal(&s.path),
         _ => {}
@@ -1895,6 +1907,7 @@ struct FetchWin {
     brush_bg: HBRUSH,
     dpi: i32,
     flp: String,
+    kind: &'static str, // "plugins" or "samples": which flctl commands and labels
     rows: Vec<FetchRow>,
     phase: FetchPhase,
     done: bool,
@@ -2066,7 +2079,8 @@ unsafe fn fetch_copy_selected(hwnd: HWND, st: &mut FetchWin) {
     fetch_update_button(hwnd, st);
     set_text(hwnd, ID_FETCH_SUMMARY, &format!("Copying {} plugin(s)\u{2026}", picked.len()));
     let flp = st.flp.clone();
-    if !spawn_flctl_events(hwnd, &["fetchplugins-many", &flp, &file.to_string_lossy(), "--json"]) {
+    let cmd = if st.kind == "samples" { "fetchsamples-many" } else { "fetchplugins-many" };
+    if !spawn_flctl_events(hwnd, &[cmd, &flp, &file.to_string_lossy(), "--json"]) {
         st.phase = FetchPhase::Ready;
         set_text(hwnd, ID_FETCH_SUMMARY, "Could not start the fetch helper.");
         fetch_update_button(hwnd, st);
@@ -2109,8 +2123,9 @@ unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
 }
 
 /// Start flctl in the background and feed its JSON lines to the window.
-unsafe fn spawn_fetch(hwnd: HWND, flp: &str) -> bool {
-    spawn_flctl_events(hwnd, &["fetchplugins", flp, "--json", "--search-only"])
+unsafe fn spawn_fetch(hwnd: HWND, flp: &str, kind: &str) -> bool {
+    let cmd = if kind == "samples" { "fetchsamples" } else { "fetchplugins" };
+    spawn_flctl_events(hwnd, &[cmd, flp, "--json", "--search-only"])
 }
 
 unsafe fn spawn_flctl_events(hwnd: HWND, args: &[&str]) -> bool {
@@ -2239,7 +2254,7 @@ unsafe extern "system" fn fetch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 
 /// Open the fetch window for `flp` and start fetching. `plugins` pre-fills the rows (empty when
 /// the project has not been checked yet: the helper then reports the list).
-pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
+pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32, kind: &'static str) {
     let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
     let class = w!("FLLibraryFetch");
     let wc = WNDCLASSEXW {
@@ -2256,7 +2271,7 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
     let (w, h) = (px(900), px(460));
     let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
     let file = flp.rsplit(SEP).next().unwrap_or(flp);
-    let title = HSTRING::from(format!("FL Library \u{2014} Fetch plugins for {file}"));
+    let title = HSTRING::from(format!("FL Library \u{2014} Fetch {kind} for {file}"));
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_APPWINDOW,
         class,
@@ -2283,10 +2298,10 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
     let font = CreateFontW(-px(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
     let bold = CreateFontW(-px(13), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
     let st = Box::into_raw(Box::new(FetchWin {
-        font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, flp: flp.to_string(), rows: Vec::new(), phase: FetchPhase::Searching, done: false,
+        font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, flp: flp.to_string(), kind, rows: Vec::new(), phase: FetchPhase::Searching, done: false,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, st as isize);
-    child(hwnd, w!("STATIC"), "Looking for the missing plugins\u{2026}", SS_NOPREFIX, 0, ID_FETCH_SUMMARY, bold);
+    child(hwnd, w!("STATIC"), &format!("Looking for the missing {kind}\u{2026}"), SS_NOPREFIX, 0, ID_FETCH_SUMMARY, bold);
     let lv = child(hwnd, w!("SysListView32"), "", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, ID_FETCH_LIST, font);
     SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, WPARAM(0), LPARAM(0x20 | 0x10000 | 0x4)); // full row, double buffer, checkboxes
     let b = button(hwnd, "Copy selected", ID_FETCH_COPY, font);
@@ -2296,7 +2311,8 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
     SendMessageW(lv, LVM_SETTEXTCOLOR, WPARAM(0), LPARAM(C_TEXT as isize));
     dark_scrollbars(lv);
     let _ = SetWindowSubclass(lv, Some(table_proc), 1, 0);
-    for (i, (title, width)) in [("Plugin", 210), ("Status", 230), ("Details", 1200)].iter().enumerate() {
+    let first = if kind == "samples" { "Sample" } else { "Plugin" };
+    for (i, (title, width)) in [(first, 230), ("Status", 230), ("Details", 1200)].iter().enumerate() {
         let mut text = wide(title);
         let col = LvColumn {
             mask: 1 | 2 | 4 | 8,
@@ -2313,7 +2329,7 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
     fetch_layout(hwnd, dpi);
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
-    if !spawn_fetch(hwnd, flp) {
+    if !spawn_fetch(hwnd, flp, kind) {
         (*st).done = true;
         set_text(hwnd, ID_FETCH_SUMMARY, "Could not start the fetch helper (Python / flctl not registered).");
     }
