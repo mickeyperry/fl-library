@@ -151,7 +151,7 @@ FACTORY_SAMPLE_RE = re.compile(r'\\image-line\\fl studio[^\\]*\\data\\patches\\'
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, encoding='utf-8') as f:
+        with open(CONFIG_PATH, encoding='utf-8-sig') as f:  # -sig: PowerShell likes to add a BOM
             cfg.update(json.load(f))
     else:
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -696,11 +696,14 @@ def scan(recheck=False):
             zip_members[p] = members
 
     known = {r[0]: (r[1], r[2]) for r in db.execute('SELECT path, size, mtime FROM files')}
-    new_flps = [p for p, v in flps.items() if recheck or known.get(p) != v]
+    # rows written by an older scanner that did not store plugin paths: parse again
+    stale = {r[0] for r in db.execute('SELECT f.path FROM files f JOIN projects p ON p.hash = f.hash '
+                                      'WHERE p.plugins LIKE \'%"vst": true%\' AND p.plugins NOT LIKE \'%"path"%\'')}
+    new_flps = [p for p, v in flps.items() if recheck or known.get(p) != v or p in stale]
     new_flps.sort(key=lambda p: p.startswith('\\\\'))  # local drives first, slow shares last
     new_zips = []
     for zp, members in zip_members.items():
-        if recheck or any(known.get(zp + '|' + m) != zips[zp] for m in members):
+        if recheck or any(known.get(zp + '|' + m) != zips[zp] or (zp + '|' + m) in stale for m in members):
             new_zips.append((zp, members))
     progress(f'{len(new_flps):,} flp + {len(new_zips):,} zip to parse')
 
