@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1339,7 +1339,7 @@ unsafe fn build(hwnd: HWND, s: &Song) {
     if s.render.is_none() {
         let _ = EnableWindow(play, false);
     }
-    button(hwnd, "All copies", ID_FIND, s.font);
+    button(hwnd, "Find copies", ID_FIND, s.font);
     button(hwnd, "Folder", ID_FOLDER, s.font);
     button(hwnd, "\u{2605} Bookmark", ID_BOOKMARK, s.font);
     let fetch = button(hwnd, if s.plugins_unchecked { "Check plugins" } else { "Fetch plugins" }, ID_FETCH, s.font);
@@ -1654,7 +1654,7 @@ unsafe fn command(hwnd: HWND, s: &mut Song, id: i32, code: u32) {
             }
         }
         ID_FIND => flctl(&["versions", &s.path]),
-        ID_FETCH => flctl(&["fetchplugins", &s.path]),
+        ID_FETCH => open_fetch_window(&s.path, &s.plugins_missing, s.dpi),
         ID_GETFL => flctl(&["getfl", &s.path]),
         ID_FOLDER => reveal(&s.path),
         _ => {}
@@ -1855,6 +1855,311 @@ pub unsafe fn create(parent: HWND, rc: RECT, path: &str) -> HWND {
     build(hwnd, &*state);
     show_results(hwnd, &mut *state);
     hwnd
+}
+
+// ---------- Fetch plugins window ----------
+// A top-level dark window with one row per plugin. flctl (Python) does the searching and copying
+// and streams one JSON object per line on stdout; the rows update live.
+
+const WM_FETCH_EVENT: u32 = WM_APP + 7;
+const ID_FETCH_LIST: i32 = 201;
+const ID_FETCH_SUMMARY: i32 = 202;
+
+struct FetchRow {
+    plugin: String,
+    status: String,
+    detail: String,
+}
+
+struct FetchWin {
+    font: HFONT,
+    bold: HFONT,
+    brush_bg: HBRUSH,
+    dpi: i32,
+    rows: Vec<FetchRow>,
+    done: bool,
+}
+
+fn fetch_status_label(status: &str) -> String {
+    match status {
+        "waiting" => "waiting".into(),
+        "searching" => "\u{2026} searching".into(),
+        "found" => "found a copy".into(),
+        "admin" => "waiting for admin permission".into(),
+        "copying" => "\u{27F3} copying\u{2026}".into(),
+        "ok" => "\u{2713} copied".into(),
+        "licensed" => "\u{2713} copied \u{2014} needs its installer".into(),
+        "notfound" => "\u{2717} not found".into(),
+        "installer" => "\u{2717} not found \u{2014} installer found".into(),
+        "offline" => "\u{2717} source PC offline".into(),
+        "error" => "\u{2717} failed".into(),
+        other => other.to_string(),
+    }
+}
+
+fn fetch_status_color(status: &str) -> u32 {
+    match status {
+        "ok" => rgb(80, 205, 120),
+        "licensed" | "offline" | "installer" | "admin" => rgb(255, 200, 60),
+        "notfound" | "error" => C_RED,
+        "found" | "copying" => C_TEXT,
+        _ => C_DIM,
+    }
+}
+
+unsafe fn fetch_upsert(hwnd: HWND, st: &mut FetchWin, plugin: &str, status: &str, detail: &str) {
+    let Ok(lv) = GetDlgItem(hwnd, ID_FETCH_LIST) else { return };
+    let label = fetch_status_label(status);
+    match st.rows.iter().position(|r| r.plugin == plugin) {
+        Some(i) => {
+            st.rows[i].status = status.to_string();
+            if !detail.is_empty() {
+                st.rows[i].detail = detail.to_string();
+            }
+            set_cell(lv, i, 1, &label, false);
+            set_cell(lv, i, 2, &st.rows[i].detail, false);
+        }
+        None => {
+            let i = st.rows.len();
+            st.rows.push(FetchRow { plugin: plugin.to_string(), status: status.to_string(), detail: detail.to_string() });
+            set_cell(lv, i, 0, plugin, true);
+            set_cell(lv, i, 1, &label, false);
+            set_cell(lv, i, 2, detail, false);
+        }
+    }
+    let _ = InvalidateRect(lv, None, true);
+}
+
+unsafe fn fetch_event(hwnd: HWND, st: &mut FetchWin, ev: &serde_json::Value) {
+    if let Some(list) = ev["plugins"].as_array() {
+        for p in list.iter().filter_map(|p| p.as_str()) {
+            fetch_upsert(hwnd, st, p, "waiting", "");
+        }
+        set_text(hwnd, ID_FETCH_SUMMARY, &format!("{} plugin(s) missing on this PC. Looking for copies\u{2026}", st.rows.len()));
+        return;
+    }
+    if let Some(name) = ev["plugin"].as_str() {
+        fetch_upsert(hwnd, st, name, ev["status"].as_str().unwrap_or(""), ev["detail"].as_str().unwrap_or(""));
+        if !st.done {
+            let copied = st.rows.iter().filter(|r| matches!(r.status.as_str(), "ok" | "licensed")).count();
+            let settled = st.rows.iter().filter(|r| matches!(r.status.as_str(), "ok" | "licensed" | "notfound" | "installer" | "offline" | "error")).count();
+            set_text(hwnd, ID_FETCH_SUMMARY, &format!("{copied} copied, {} to go\u{2026}", st.rows.len().saturating_sub(settled)));
+        }
+        return;
+    }
+    if let Some(text) = ev["summary"].as_str() {
+        st.done = true;
+        set_text(hwnd, ID_FETCH_SUMMARY, text);
+        return;
+    }
+    if ev["none"].as_bool() == Some(true) {
+        st.done = true;
+        set_text(hwnd, ID_FETCH_SUMMARY, "All plugins this project uses are installed on this PC.");
+        return;
+    }
+    if ev["ended"].as_bool() == Some(true) && !st.done {
+        st.done = true;
+        let err = ev["stderr"].as_str().unwrap_or("").lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+        set_text(hwnd, ID_FETCH_SUMMARY, &format!("The fetch helper stopped unexpectedly. {err}"));
+    }
+}
+
+unsafe fn fetch_layout(hwnd: HWND, dpi: i32) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let px = |v: i32| v * dpi / 96;
+    let (m, w) = (px(12), rc.right - 2 * px(12));
+    place(hwnd, ID_FETCH_SUMMARY, m, px(10), w, px(36), true);
+    place(hwnd, ID_FETCH_LIST, m, px(52), w, rc.bottom - px(52) - m, true);
+}
+
+/// Start flctl in the background and feed its JSON lines to the window.
+unsafe fn spawn_fetch(hwnd: HWND, flp: &str) -> bool {
+    let (Some(py), Some(ctl)) = (reg_str(w!("Pythonw")), reg_str(w!("Ctl"))) else { return false };
+    // the console python: pythonw has no stdout to pipe
+    let exe = {
+        let low = py.to_lowercase();
+        match low.rfind("pythonw.exe") {
+            Some(i) if std::path::Path::new(&format!("{}python.exe", &py[..i])).exists() => format!("{}python.exe", &py[..i]),
+            _ => py,
+        }
+    };
+    let Ok(mut child) = Command::new(exe)
+        .arg(ctl)
+        .args(["fetchplugins", flp, "--json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x0800_0000)
+        .spawn()
+    else {
+        return false;
+    };
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else { return false };
+    let target = hwnd.0 as isize;
+    let post = move |v: serde_json::Value| -> bool {
+        let b = Box::into_raw(Box::new(v));
+        if PostMessageW(HWND(target as *mut c_void), WM_FETCH_EVENT, WPARAM(0), LPARAM(b as isize)).is_err() {
+            drop(Box::from_raw(b));
+            return false;
+        }
+        true
+    };
+    std::thread::spawn(move || {
+        let err_thread = std::thread::spawn(move || {
+            let mut text = String::new();
+            let mut err = err;
+            let _ = err.read_to_string(&mut text);
+            text
+        });
+        let mut reader = std::io::BufReader::new(out);
+        let mut line = String::new();
+        while let Ok(n) = reader.read_line(&mut line) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim_end()) {
+                if !post(v) {
+                    break; // window closed; the helper finishes its copies on its own
+                }
+            }
+            line.clear();
+        }
+        let _ = child.wait();
+        let stderr = err_thread.join().unwrap_or_default();
+        post(serde_json::json!({ "ended": true, "stderr": stderr }));
+    });
+    true
+}
+
+unsafe extern "system" fn fetch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let st = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FetchWin;
+    match msg {
+        WM_FETCH_EVENT if lp.0 != 0 => {
+            let ev = Box::from_raw(lp.0 as *mut serde_json::Value);
+            if !st.is_null() {
+                let _ = catch_unwind(AssertUnwindSafe(|| fetch_event(hwnd, &mut *st, &ev)));
+            }
+            LRESULT(0)
+        }
+        WM_SIZE if !st.is_null() => {
+            fetch_layout(hwnd, (*st).dpi);
+            LRESULT(0)
+        }
+        WM_NOTIFY if !st.is_null() && lp.0 != 0 => {
+            let hdr = &*(lp.0 as *const NmHdr);
+            if hdr.code == NM_CUSTOMDRAW && hdr.id as i32 == ID_FETCH_LIST {
+                let cd = &mut *(lp.0 as *mut NmColorDraw);
+                if cd.cd.stage == CDDS_PREPAINT {
+                    return LRESULT(CDRF_NOTIFYITEMDRAW);
+                }
+                if cd.cd.stage == CDDS_ITEMPREPAINT {
+                    let rows = &(&*st).rows;
+                    if let Some(r) = rows.get(cd.cd.item) {
+                        cd.clr_text = fetch_status_color(&r.status);
+                        cd.clr_text_bk = C_FIELD;
+                    }
+                }
+                return LRESULT(CDRF_DODEFAULT);
+            }
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC if !st.is_null() => {
+            let hdc = HDC(wp.0 as *mut c_void);
+            SetTextColor(hdc, COLORREF(C_TEXT));
+            SetBkColor(hdc, COLORREF(C_BG));
+            LRESULT((*st).brush_bg.0 as isize)
+        }
+        WM_DESTROY => {
+            if !st.is_null() {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let b = Box::from_raw(st);
+                let _ = DeleteObject(b.font);
+                let _ = DeleteObject(b.bold);
+                let _ = DeleteObject(b.brush_bg);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Open the fetch window for `flp` and start fetching. `plugins` pre-fills the rows (empty when
+/// the project has not been checked yet: the helper then reports the list).
+pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
+    let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+    let class = w!("FLLibraryFetch");
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(fetch_proc),
+        hInstance: hinst,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        hbrBackground: CreateSolidBrush(COLORREF(C_BG)),
+        lpszClassName: class,
+        ..Default::default()
+    };
+    RegisterClassExW(&wc);
+    let px = |v: i32| v * dpi / 96;
+    let (w, h) = (px(900), px(460));
+    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    let file = flp.rsplit(SEP).next().unwrap_or(flp);
+    let title = HSTRING::from(format!("FL Library \u{2014} Fetch plugins for {file}"));
+    let Ok(hwnd) = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        class,
+        &title,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        (sw - w) / 2,
+        (sh - h) / 2,
+        w,
+        h,
+        None,
+        None,
+        hinst,
+        None,
+    ) else {
+        return;
+    };
+    let dark: i32 = 1;
+    let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+        hwnd,
+        windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(20), // DWMWA_USE_IMMERSIVE_DARK_MODE
+        &dark as *const i32 as *const c_void,
+        4,
+    );
+    let font = CreateFontW(-px(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
+    let bold = CreateFontW(-px(13), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
+    let st = Box::into_raw(Box::new(FetchWin { font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, rows: Vec::new(), done: false }));
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, st as isize);
+    child(hwnd, w!("STATIC"), "Looking for the missing plugins\u{2026}", SS_NOPREFIX, 0, ID_FETCH_SUMMARY, bold);
+    let lv = child(hwnd, w!("SysListView32"), "", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, ID_FETCH_LIST, font);
+    SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, WPARAM(0), LPARAM(0x20 | 0x10000));
+    SendMessageW(lv, LVM_SETBKCOLOR, WPARAM(0), LPARAM(C_FIELD as isize));
+    SendMessageW(lv, LVM_SETTEXTBKCOLOR, WPARAM(0), LPARAM(C_FIELD as isize));
+    SendMessageW(lv, LVM_SETTEXTCOLOR, WPARAM(0), LPARAM(C_TEXT as isize));
+    dark_scrollbars(lv);
+    let _ = SetWindowSubclass(lv, Some(table_proc), 1, 0);
+    for (i, (title, width)) in [("Plugin", 210), ("Status", 230), ("Details", 1200)].iter().enumerate() {
+        let mut text = wide(title);
+        let col = LvColumn {
+            mask: 1 | 2 | 4 | 8,
+            fmt: 0,
+            cx: width * dpi / 96,
+            text: text.as_mut_ptr(),
+            cch: 0, sub: i as i32, image: 0, order: 0, cx_min: 0, cx_default: 0, cx_ideal: 0,
+        };
+        SendMessageW(lv, LVM_INSERTCOLUMNW, WPARAM(i), LPARAM(&col as *const LvColumn as isize));
+    }
+    for p in plugins {
+        fetch_upsert(hwnd, &mut *st, p, "waiting", "");
+    }
+    fetch_layout(hwnd, dpi);
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = SetForegroundWindow(hwnd);
+    if !spawn_fetch(hwnd, flp) {
+        (*st).done = true;
+        set_text(hwnd, ID_FETCH_SUMMARY, "Could not start the fetch helper (Python / flctl not registered).");
+    }
 }
 
 // ---------- COM (preview handler) ----------
