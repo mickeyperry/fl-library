@@ -143,6 +143,7 @@ const TVI_ROOT: isize = -0x10000;
 const TVI_LAST: isize = -0x0FFFE;
 const NM_CLICK: i32 = -2;
 const NM_DBLCLK: i32 = -3;
+const NM_RCLICK: i32 = -5;
 const NM_CUSTOMDRAW: i32 = -12;
 const LVN_COLUMNCLICK: i32 = -108;
 const CDDS_PREPAINT: u32 = 1;
@@ -1869,6 +1870,7 @@ struct FetchRow {
     plugin: String,
     status: String,
     detail: String,
+    sources: Vec<String>, // every copy found, best first (right-click to pick one)
 }
 
 struct FetchWin {
@@ -1876,6 +1878,7 @@ struct FetchWin {
     bold: HFONT,
     brush_bg: HBRUSH,
     dpi: i32,
+    flp: String,
     rows: Vec<FetchRow>,
     done: bool,
 }
@@ -1921,7 +1924,7 @@ unsafe fn fetch_upsert(hwnd: HWND, st: &mut FetchWin, plugin: &str, status: &str
         }
         None => {
             let i = st.rows.len();
-            st.rows.push(FetchRow { plugin: plugin.to_string(), status: status.to_string(), detail: detail.to_string() });
+            st.rows.push(FetchRow { plugin: plugin.to_string(), status: status.to_string(), detail: detail.to_string(), sources: Vec::new() });
             set_cell(lv, i, 0, plugin, true);
             set_cell(lv, i, 1, &label, false);
             set_cell(lv, i, 2, detail, false);
@@ -1940,6 +1943,11 @@ unsafe fn fetch_event(hwnd: HWND, st: &mut FetchWin, ev: &serde_json::Value) {
     }
     if let Some(name) = ev["plugin"].as_str() {
         fetch_upsert(hwnd, st, name, ev["status"].as_str().unwrap_or(""), ev["detail"].as_str().unwrap_or(""));
+        if let Some(list) = ev["sources"].as_array() {
+            if let Some(row) = st.rows.iter_mut().find(|r| r.plugin == name) {
+                row.sources = list.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
+            }
+        }
         if !st.done {
             let copied = st.rows.iter().filter(|r| matches!(r.status.as_str(), "ok" | "licensed")).count();
             let settled = st.rows.iter().filter(|r| matches!(r.status.as_str(), "ok" | "licensed" | "notfound" | "installer" | "offline" | "error")).count();
@@ -1973,8 +1981,47 @@ unsafe fn fetch_layout(hwnd: HWND, dpi: i32) {
     place(hwnd, ID_FETCH_LIST, m, px(52), w, rc.bottom - px(52) - m, true);
 }
 
+/// Right-click / double-click on a row: pick which copy to fetch from.
+unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
+    let Ok(lv) = GetDlgItem(hwnd, ID_FETCH_LIST) else { return };
+    let i = SendMessageW(lv, LVM_GETNEXTITEM, WPARAM(usize::MAX), LPARAM(LVNI_SELECTED)).0;
+    if i < 0 {
+        return;
+    }
+    let Some(row) = st.rows.get(i as usize) else { return };
+    let Ok(menu) = CreatePopupMenu() else { return };
+    if row.sources.is_empty() {
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("No copy of this plugin was found"));
+    } else {
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("Copy from\u{2026}"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (n, src) in row.sources.iter().enumerate() {
+            let _ = AppendMenuW(menu, MF_STRING, n + 1, &HSTRING::from(src.replace('&', "&&")));
+        }
+    }
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = SetForegroundWindow(hwnd);
+    let pick = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None).0 as usize;
+    let _ = DestroyMenu(menu);
+    if pick == 0 {
+        return;
+    }
+    let (plugin, src, flp) = (row.plugin.clone(), row.sources[pick - 1].clone(), st.flp.clone());
+    st.done = false;
+    fetch_upsert(hwnd, st, &plugin, "copying", &src);
+    set_text(hwnd, ID_FETCH_SUMMARY, &format!("Copying {plugin}\u{2026}"));
+    if !spawn_flctl_events(hwnd, &["fetchplugins-one", &flp, &plugin, &src, "--json"]) {
+        fetch_upsert(hwnd, st, &plugin, "error", "could not start the fetch helper");
+    }
+}
+
 /// Start flctl in the background and feed its JSON lines to the window.
 unsafe fn spawn_fetch(hwnd: HWND, flp: &str) -> bool {
+    spawn_flctl_events(hwnd, &["fetchplugins", flp, "--json"])
+}
+
+unsafe fn spawn_flctl_events(hwnd: HWND, args: &[&str]) -> bool {
     let (Some(py), Some(ctl)) = (reg_str(w!("Pythonw")), reg_str(w!("Ctl"))) else { return false };
     // the console python: pythonw has no stdout to pipe
     let exe = {
@@ -1986,7 +2033,7 @@ unsafe fn spawn_fetch(hwnd: HWND, flp: &str) -> bool {
     };
     let Ok(mut child) = Command::new(exe)
         .arg(ctl)
-        .args(["fetchplugins", flp, "--json"])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2062,6 +2109,9 @@ unsafe extern "system" fn fetch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 return LRESULT(CDRF_DODEFAULT);
             }
+            if (hdr.code == NM_RCLICK || hdr.code == NM_DBLCLK) && hdr.id as i32 == ID_FETCH_LIST {
+                let _ = catch_unwind(AssertUnwindSafe(|| fetch_pick_source(hwnd, &mut *st)));
+            }
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC if !st.is_null() => {
@@ -2129,7 +2179,7 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32) {
     );
     let font = CreateFontW(-px(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
     let bold = CreateFontW(-px(13), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
-    let st = Box::into_raw(Box::new(FetchWin { font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, rows: Vec::new(), done: false }));
+    let st = Box::into_raw(Box::new(FetchWin { font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, flp: flp.to_string(), rows: Vec::new(), done: false }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, st as isize);
     child(hwnd, w!("STATIC"), "Looking for the missing plugins\u{2026}", SS_NOPREFIX, 0, ID_FETCH_SUMMARY, bold);
     let lv = child(hwnd, w!("SysListView32"), "", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, ID_FETCH_LIST, font);

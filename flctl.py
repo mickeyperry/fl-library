@@ -267,6 +267,8 @@ def plugin_sources(cfg, name, path, local_copies=()):
         score = 0
         if low.endswith(os.path.dirname(path).lower().split('\\')[-1] + '\\' + base.lower()):
             score += 3  # same folder name as the project had
+        if '\\program files' in low and '\\bu\\' not in low and 'backup' not in low and '\\old ' not in low:
+            score += 2  # a real install, not a backup copy
         machine = pe_machine(full) if want64 else None
         if machine == PE_X64:
             score += 2
@@ -426,7 +428,8 @@ def fetch_plugins(flp, json_out=False):
         emit(plugin=name, status='searching', detail=os.path.basename(path))
         sources = plugin_sources(cfg, name, path, local)
         if sources:
-            emit(plugin=name, status='found', detail=f'{len(sources)} cop{"y" if len(sources) == 1 else "ies"}, best: {sources[0][0]}')
+            emit(plugin=name, status='found', detail=f'{len(sources)} cop{"y" if len(sources) == 1 else "ies"}, best: {sources[0][0]}',
+                 sources=[s for s, _w in sources[:20]])
             plan.append((name, path, sources))
         else:
             inst = installer_candidates(cfg, name)
@@ -438,52 +441,100 @@ def fetch_plugins(flp, json_out=False):
     for name, path, _l in missing:
         if not any(n == name for n, _p, _s in plan):
             report.append(f'XX  {name}: no copy found on any drive or PC')
-    ok = 0
-    if plan:
-        needs_admin = any(not os.access(nearest_existing_dir(plugin_dest(cfg, sources[0][0], path)), os.W_OK)
-                          for _n, path, sources in plan)
-        if needs_admin:
-            for name, _p, _s in plan:
-                emit(plugin=name, status='admin', detail='copying into Program Files needs admin permission')
-            fd, plan_file = tempfile.mkstemp(prefix='fl-library-fetch-', suffix='.json')
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(plan, f)
-            out_file = plan_file + '.out'
-            params = f'"{os.path.abspath(__file__)}" fetchplugins-copy "{plan_file}"'
-            if run_elevated_and_wait(sys.executable, params):
-                try:
-                    for line in open(out_file, encoding='utf-8'):
-                        ev = json.loads(line)
-                        if 'plugin' in ev:
-                            emit(**ev)
-                            if ev['status'] in ('ok', 'licensed'):
-                                ok += 1
-                        elif 'report' in ev:
-                            report.append(ev['report'])
-                except OSError:
-                    emit(summary='The elevated copy step did not report back.')
-            else:
-                for name, _p, _s in plan:
-                    emit(plugin=name, status='error', detail='admin permission was not given')
-                report.append('XX  copying into Program Files needs admin permission')
-            for f in (plan_file, out_file):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-        else:
-            ok, lines = copy_batch(cfg, db, plan, emit)
-            report += lines
+    ok, lines = copy_plan(cfg, db, plan, emit)
+    report += lines
     db.close()
     n = len(missing)
     summary = f"{ok} of {n} missing plugin(s) copied into this PC's VST folders."
     if ok:
         summary += ' Now run Options > Manage plugins > Find more plugins in FL once, then reopen the project.'
+    if n - ok:
+        summary += ' Right-click a row to copy from a different source.'
     emit(summary=summary, ok=ok, total=n)
     text = summary + '\n\n' + '\n'.join(report)
     if ok:
         text += '\n\nPlugins that came with an installer (licensed / with data folders) may still need to be installed properly.'
     say(text, 0x40 if ok == n else 0x30)
+
+
+def can_write(directory):
+    """Really try: os.access() says yes for Program Files although UAC says no."""
+    import tempfile
+    try:
+        with tempfile.TemporaryFile(dir=nearest_existing_dir(os.path.join(directory, 'x'))):
+            return True
+    except OSError:
+        return False
+
+
+def copy_plan(cfg, db, plan, emit):
+    """Copy every plugin in the plan, in this process when the VST folders are writable, else in
+    one elevated copy of this script (a single UAC prompt) that reports back through a file.
+    Returns (copied count, report lines)."""
+    import tempfile
+    if not plan:
+        return 0, []
+    is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    needs_admin = not is_admin and any(not can_write(os.path.dirname(plugin_dest(cfg, sources[0][0], path)))
+                                       for _n, path, sources in plan)
+    if not needs_admin:
+        return copy_batch(cfg, db, plan, emit)
+    ok, report = 0, []
+    for name, _p, _s in plan:
+        emit(plugin=name, status='admin', detail='copying into Program Files needs admin permission')
+    fd, plan_file = tempfile.mkstemp(prefix='fl-library-fetch-', suffix='.json')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(plan, f)
+    out_file = plan_file + '.out'
+    params = f'"{os.path.abspath(__file__)}" fetchplugins-copy "{plan_file}"'
+    if run_elevated_and_wait(sys.executable, params):
+        try:
+            for line in open(out_file, encoding='utf-8'):
+                ev = json.loads(line)
+                if 'plugin' in ev:
+                    emit(**ev)
+                    if ev['status'] in ('ok', 'licensed'):
+                        ok += 1
+                elif 'report' in ev:
+                    report.append(ev['report'])
+        except OSError:
+            for name, _p, _s in plan:
+                emit(plugin=name, status='error', detail='the elevated copy step did not report back')
+    else:
+        for name, _p, _s in plan:
+            emit(plugin=name, status='error', detail='admin permission was not given')
+        report.append('XX  copying into Program Files needs admin permission')
+    for f in (plan_file, out_file):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return ok, report
+
+
+def fetch_one(flp, name, src, json_out=True):
+    """Copy one plugin of the project from the source the user picked (fetch window, right-click)."""
+    def emit(**ev):
+        if json_out:
+            sys.stdout.write(json.dumps(ev) + '\n')
+            sys.stdout.flush()
+
+    cfg = scanner.load_config()
+    db = scanner.connect()
+    path = next((p['path'] for p in project_plugins(db, os.path.abspath(flp)) if p['name'] == name), None)
+    if not path:
+        emit(plugin=name, status='error', detail='plugin not found in the project')
+        db.close()
+        return
+    if not os.path.exists(src):
+        emit(plugin=name, status='offline' if src.startswith('\\\\') else 'error',
+             detail=f'{src} is not reachable right now')
+        db.close()
+        return
+    ok, _report = copy_plan(cfg, db, [(name, path, [(src, 'chosen')])], emit)
+    db.close()
+    emit(summary=('Copied. Now run Options > Manage plugins > Find more plugins in FL once, then reopen the project.'
+                  if ok else 'Not copied. Right-click the row to try another source.'), ok=ok, total=1)
 
 
 def fetch_copy_elevated(plan_file):
@@ -545,6 +596,9 @@ def main(argv):
         return
     if cmd == 'fetchplugins-copy':  # the elevated copy step
         fetch_copy_elevated(argv[1])
+        return
+    if cmd == 'fetchplugins-one':  # fetchplugins-one <flp> <plugin name> <source path> [--json]
+        fetch_one(argv[1], argv[2], argv[3], json_out='--json' in argv[4:])
         return
     if cmd == 'getfl':
         get_fl(argv[1])
