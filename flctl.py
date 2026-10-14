@@ -525,6 +525,10 @@ def copy_batch(cfg, db, batch, emit):
         for src, where in sources:
             if where == 'offline':
                 continue
+            if src.startswith('\\\\') and not host_alive(src.split('\\')[2]):
+                trace(f'copy {name}: {src} host is off, next')
+                errors.append((src, OSError(53, 'the PC is off')))
+                continue
             trace(f'copy {name}: dest for {src}')
             dest = plugin_dest(cfg, src, path)
             trace(f'copy {name}: {src} -> {dest}')
@@ -641,10 +645,10 @@ def fetch_plugins(flp, json_out=False, search_only=False):
         elif o:
             inst = installer_candidates(cfg, name)
             hosts = sorted({s.split('\\')[2] for s, _w in sources})
-            emit(plugin=name, status='only32', detail='no 64-bit copy on any drive or PC that is on'
-                 + (f" ({', '.join(hosts)} is off)" if hosts else '') + ': FL has to bridge the 32-bit one'
-                 + (f'; installer: {inst[0]}' if inst else ' (if it still fails to open, it needs its installer)'),
-                 sources=[s for s, _w in sources[:20]])
+            emit(plugin=name, status='only32', detail='the 32-bit copy is installed here already; no 64-bit copy on any drive or PC that is on'
+                 + (f" ({', '.join(hosts)} is off: unchecked)" if hosts else '') + '. FL has to bridge it'
+                 + (f'; installer: {inst[0]}' if inst else '; if it still fails to open it needs its installer'),
+                 sources=[])
         elif not sources:
             inst = installer_candidates(cfg, name)
             if inst:
@@ -776,10 +780,22 @@ def fetch_many(flp, plan_file, json_out=True):
         name, src = w['name'], w['src']
         if name not in stored:
             emit(plugin=name, status='error', detail='plugin not found in the project')
-        elif not os.path.exists(src):
-            emit(plugin=name, status='offline' if src.startswith('\\\\') else 'error', detail=f'{src} is not reachable right now')
-        else:
-            plan.append((name, stored[name], [(src, 'chosen')]))
+            continue
+        # the chosen copy first, then every other copy the search found: a host that is off now
+        # just means the next copy is used
+        sources = [src] + [s for s in w.get('sources') or [] if s.lower() != src.lower()]
+        live, dead = [], []
+        for s in sources:
+            if s.startswith('\\\\') and not host_alive(s.split('\\')[2]):
+                dead.append(s.split('\\')[2])
+            else:
+                live.append((s, 'chosen' if s == src else 'alt'))
+        if not live:
+            emit(plugin=name, status='offline', detail=f"every copy is on a PC that is off ({', '.join(sorted(set(dead)))})")
+            continue
+        if live[0][1] != 'chosen':
+            emit(plugin=name, status='copying', detail=f'{src} is not reachable: using {live[0][0]}')
+        plan.append((name, stored[name], live))
     ok, _report = copy_plan(cfg, db, plan, emit)
     db.close()
     text = f'{ok} of {len(wanted)} copied.'

@@ -2150,7 +2150,12 @@ unsafe fn fetch_copy_selected(hwnd: HWND, st: &mut FetchWin) {
     let mut picked = Vec::new();
     for (i, r) in st.rows.iter().enumerate() {
         if lv_is_checked(lv, i) && !r.sources.is_empty() {
-            plan.push(serde_json::json!({ "name": r.plugin, "src": r.sources[r.chosen.min(r.sources.len() - 1)] }));
+            // the chosen copy first, then every other copy found: the helper falls back to the
+            // next one when a host is off
+            let chosen = r.chosen.min(r.sources.len() - 1);
+            let mut sources = vec![r.sources[chosen].clone()];
+            sources.extend(r.sources.iter().enumerate().filter(|(i, _)| *i != chosen).map(|(_, s)| s.clone()));
+            plan.push(serde_json::json!({ "name": r.plugin, "src": r.sources[chosen], "sources": sources }));
             picked.push(r.plugin.clone());
         }
     }
