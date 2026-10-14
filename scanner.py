@@ -343,16 +343,22 @@ def refresh_plugin_files(db, cfg):
     dirs = vst_dirs(cfg)['all']
     known = fl_known_plugins()
     rows = {}
+
+    def put(name, path, machine):  # one row per file name: the 64-bit copy wins when there are several
+        cur = rows.get(name)
+        if cur is None or (cur[1] != PE_X64 and machine == PE_X64):
+            rows[name] = (path, machine)
+
     for path in known:
-        rows[ntpath.basename(path)] = (path, None if '%' in path else pe_machine(path))
+        put(ntpath.basename(path), path, None if '%' in path else pe_machine(path))
     try:
         found = local_plugin_hits(cfg, names, strict=True)
     except (OSError, ValueError):
         return None  # Everything unreachable: keep the table as it is rather than shrink it
     for name, hits in found.items():
         for full, _size in hits:
-            if in_vst_dirs(full, dirs) and name not in rows:
-                rows[name] = (full, pe_machine(full))
+            if in_vst_dirs(full, dirs):
+                put(name, full, pe_machine(full))
     db.execute('DELETE FROM plugin_files')
     db.executemany('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
                    [(n, p, m) for n, (p, m) in rows.items()])
