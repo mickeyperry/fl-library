@@ -219,21 +219,45 @@ def missing_plugins(db, flp, cfg):
     if not plugins:
         return []
     dirs = scanner.vst_dirs(cfg)['all']
-    known = {os.path.basename(k) for k in scanner.fl_known_plugins()}
-    known |= {r[0] for r in db.execute('SELECT file FROM plugin_files')}
-    known_stems = {scanner.plugin_stem(k) for k in known}
+    known = {}  # file name -> paths FL or the scanner know on this PC
+    for k in scanner.fl_known_plugins():
+        known.setdefault(os.path.basename(k), []).append(k)
+    for file, path, machine in db.execute('SELECT file, path, machine FROM plugin_files'):
+        known.setdefault(file, []).append(path)
+        if machine:
+            _MACHINE[path.lower()] = machine
+    by_stem = {}
+    for k, paths in known.items():
+        by_stem.setdefault(scanner.plugin_stem(k), []).extend(paths)
     bases = [os.path.basename(p['path']).lower() for p in plugins]
     hits = scanner.local_plugin_hits(cfg, bases + [scanner.plugin_stem(b) for b in bases])
     out = []
     for p, base in zip(plugins, bases):
         stem = scanner.plugin_stem(base)
-        if base in known or stem in known_stems:
-            continue
         local = hits.get(base, []) + [h for h in hits.get(stem, []) if stem != base]
-        if any(scanner.in_vst_dirs(full, dirs) for full, _ in local):
+        copies = known.get(base, []) + by_stem.get(stem, []) + [full for full, _ in local if scanner.in_vst_dirs(full, dirs)]
+        if any(is_64bit(c) for c in copies):
             continue
-        out.append((p['name'], p['path'], [full for full, _ in local]))
+        out.append((p['name'], p['path'], [full for full, _ in local], bool(copies)))
     return out
+
+
+_MACHINE = {}  # plugin file (lower-case) -> PE machine, so each file is opened once per run
+
+FL_RESCAN_NOTE = ('Now in FL: Options > Manage plugins, tick "Verify plugins", Find plugins (FL only matches a '
+                  'plugin by the name it reports, and only a verified scan learns it), then reopen the project.')
+
+
+def is_64bit(path):
+    """Can FL 64 Bit load this plugin file natively? (.vst3 and FL's own always; a .dll by its
+    header.) 32-bit ones go through FL's bridge, which is what fails on a PC without the rest of
+    the plugin's install."""
+    low = path.lower()
+    if '%' in low or low.endswith('.vst3') or '.vst3\\' in low:
+        return True
+    if low not in _MACHINE:
+        _MACHINE[low] = scanner.pe_machine(path)
+    return _MACHINE[low] == scanner.PE_X64
 
 
 def plugin_sources(cfg, name, path, local_copies=()):
@@ -276,14 +300,21 @@ def plugin_sources(cfg, name, path, local_copies=()):
             score += 1
         scored.append((score, full, where))
     scored.sort(key=lambda t: -t[0])
-    if want64:  # bitness needs the file opened: only for the few that are in the running
-        top = []
-        for score, full, where in scored[:6]:
-            machine = pe_machine(full)
-            top.append((score + (2 if machine == PE_X64 else 1 if machine == PE_X86 else 0), full, where))
+    if want64:  # a 64-bit copy beats any 32-bit one: FL 64 Bit loads it without the bridge.
+        top = []  # (bitness needs the file header read: only for the ones in the running)
+        for score, full, where in scored[:40]:
+            if full.lower() not in _MACHINE:
+                _MACHINE[full.lower()] = pe_machine(full)
+            machine = _MACHINE[full.lower()]
+            top.append((score + (10 if machine == PE_X64 else 1 if machine == PE_X86 else 0), full, where))
         top.sort(key=lambda t: -t[0])
-        scored = top + scored[6:]
+        scored = top + scored[40:]
     return [(full, where) for _, full, where in scored] + offline
+
+
+def bits_label(path):
+    m = _MACHINE.get(path.lower())
+    return '64-bit' if m == PE_X64 or path.lower().endswith('.vst3') else '32-bit' if m == PE_X86 else ''
 
 
 _HOSTS = {}
@@ -364,6 +395,7 @@ def copy_plugin(src, dest, progress=None):
     import shutil
     bundle = vst3_bundle(src)
     files = []  # (source file, dest file)
+    shortcuts = []
     if bundle:
         for root, _dirs, names in os.walk(bundle):
             for n in names:
@@ -374,12 +406,16 @@ def copy_plugin(src, dest, progress=None):
         sdir, ddir = os.path.dirname(src), os.path.dirname(dest)
         stem = os.path.splitext(os.path.basename(src))[0].lower()
         folder_is_generic = os.path.basename(sdir).lower() in GENERIC_PLUGIN_DIRS
-        extras = []
+        extras, shortcuts = [], []
         for entry in os.listdir(sdir):
             s = os.path.join(sdir, entry)
             if os.path.normcase(s) == os.path.normcase(src):
                 continue
             same_stem = os.path.splitext(entry)[0].lower().startswith(stem)
+            if entry.lower().endswith('.lnk'):
+                if same_stem:  # e.g. Atmosphere.dat.lnk: the sound library lives elsewhere on the source PC
+                    shortcuts.append(entry)
+                continue
             if same_stem or not folder_is_generic:  # a plugin in its own folder: bring the folder
                 extras.append((s, os.path.join(ddir, entry)))
         files += [(s, d) for s, d in extras if os.path.isfile(s)]
@@ -403,6 +439,8 @@ def copy_plugin(src, dest, progress=None):
         note = f'its folder is {total / 2**30:.1f} GB (a sound library?): only the plugin file was copied, install it properly for the rest'
         files = [files[i] for i in keep]
         total = sum(sizes[i] for i in keep)
+    if shortcuts:
+        note += ('; ' if note else '') + f'{", ".join(shortcuts)} is a shortcut to data elsewhere on the source PC: it needs its installer'
     done = 0
     for s, d in files:
         os.makedirs(os.path.dirname(d), exist_ok=True)
@@ -503,7 +541,7 @@ def fetch_plugins(flp, json_out=False, search_only=False):
     db = scanner.connect()
     try:
         missing = missing_plugins(db, flp, cfg)
-        trace(f'fetch: missing {[n for n, _p, _l in missing]}')
+        trace(f'fetch: missing {[(n, "32-bit only" if o else "missing") for n, _p, _l, o in missing]}')
     except Exception as e:
         emit(plugin='(check)', status='error', detail=str(e))
         emit(summary=f'Could not check the plugins: {e}')
@@ -515,13 +553,14 @@ def fetch_plugins(flp, json_out=False, search_only=False):
         say('All plugins this project uses are installed on this PC.')
         db.close()
         return
-    emit(plugins=[name for name, _p, _l in missing])
+    emit(plugins=[name for name, _p, _l, _o in missing])
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    for name, path, _l in missing:
-        emit(plugin=name, status='searching', detail=os.path.basename(path))
+    only32 = {name for name, _p, _l, o in missing if o}
+    for name, path, _l, o in missing:
+        emit(plugin=name, status='searching', detail=os.path.basename(path) + (' is here but only 32-bit: looking for a 64-bit copy' if o else ''))
     found = {}
     with ThreadPoolExecutor(max_workers=6) as pool:  # all plugins at once: the waits are network
-        futures = {pool.submit(plugin_sources, cfg, name, path, local): name for name, path, local in missing}
+        futures = {pool.submit(plugin_sources, cfg, name, path, local): name for name, path, local, _o in missing}
         for fut in as_completed(futures):
             name = futures[fut]
             try:
@@ -529,21 +568,32 @@ def fetch_plugins(flp, json_out=False, search_only=False):
             except Exception as e:
                 sources = []
                 emit(plugin=name, status='error', detail=f'search failed: {e}')
+            if name in only32:  # the 32-bit one is installed already: only a 64-bit copy helps
+                sources = [(s, w) for s, w in sources if w == 'offline' or bits_label(s) == '64-bit']
             found[name] = sources
             live = [s for s, w in sources if w != 'offline']
             if live:
-                emit(plugin=name, status='found', detail=f'{len(live)} cop{"y" if len(live) == 1 else "ies"}, best: {live[0]}',
+                bits = bits_label(live[0])
+                emit(plugin=name, status='found',
+                     detail=f'{len(live)} cop{"y" if len(live) == 1 else "ies"}, best: {live[0]}' + (f'   ({bits})' if bits else ''),
                      sources=[s for s, _w in sources[:20]])
-            elif sources:
+            elif sources and name not in only32:
                 hosts = sorted({s.split('\\')[2] for s, _w in sources})
                 emit(plugin=name, status='offline', detail=f"copies exist on {', '.join(hosts)} but it is offline right now",
                      sources=[s for s, _w in sources[:20]])
     trace('fetch: search done')
     plan = []
-    for name, path, _l in missing:
+    for name, path, _l, o in missing:
         sources = found.get(name) or []
         if any(w != 'offline' for _s, w in sources):
             plan.append((name, path, sources))
+        elif o:
+            inst = installer_candidates(cfg, name)
+            hosts = sorted({s.split('\\')[2] for s, _w in sources})
+            emit(plugin=name, status='only32', detail='no 64-bit copy on any drive or PC that is on'
+                 + (f" ({', '.join(hosts)} is off)" if hosts else '') + ': FL has to bridge the 32-bit one'
+                 + (f'; installer: {inst[0]}' if inst else ' (if it still fails to open, it needs its installer)'),
+                 sources=[s for s, _w in sources[:20]])
         elif not sources:
             inst = installer_candidates(cfg, name)
             if inst:
@@ -553,13 +603,13 @@ def fetch_plugins(flp, json_out=False, search_only=False):
     if search_only:  # the fetch window: the user picks what to copy, then fetchplugins-many
         db.close()
         n, k = len(missing), len(plan)
-        text = f'{k} of {n} missing plugin(s) found.'
+        text = f'{k} of {n} plugin(s) found.'
         text += (' Untick what you do not want, right-click a row to change its source, then Copy selected.' if k
                  else ' Nothing to copy: no copy of them on any drive or PC that is on.')
         emit(searched=True, found=k, total=n, summary=text)
         return
     report = []
-    for name, path, _l in missing:
+    for name, path, _l, _o in missing:
         if not any(n == name for n, _p, _s in plan):
             report.append(f'XX  {name}: no copy found on any drive or PC')
     ok, lines = copy_plan(cfg, db, plan, emit)
@@ -568,7 +618,7 @@ def fetch_plugins(flp, json_out=False, search_only=False):
     n = len(missing)
     summary = f"{ok} of {n} missing plugin(s) copied into this PC's VST folders."
     if ok:
-        summary += ' Now run Options > Manage plugins > Find more plugins in FL once, then reopen the project.'
+        summary += ' ' + FL_RESCAN_NOTE
     if n - ok:
         summary += ' Right-click a row to copy from a different source.'
     emit(summary=summary, ok=ok, total=n)
@@ -683,7 +733,7 @@ def fetch_many(flp, plan_file, json_out=True):
     db.close()
     text = f'{ok} of {len(wanted)} copied.'
     if ok:
-        text += ' Now run Options > Manage plugins > Find more plugins in FL once, then reopen the project.'
+        text += ' ' + FL_RESCAN_NOTE
     if ok < len(wanted):
         text += ' Right-click a failed row to pick another source and Copy selected again.'
     emit(summary=text, ok=ok, total=len(wanted))
@@ -713,7 +763,7 @@ def fetch_one(flp, name, src, json_out=True):
         return
     ok, _report = copy_plan(cfg, db, [(name, path, [(src, 'chosen')])], emit)
     db.close()
-    emit(summary=('Copied. Now run Options > Manage plugins > Find more plugins in FL once, then reopen the project.'
+    emit(summary=('Copied. ' + FL_RESCAN_NOTE
                   if ok else 'Not copied. Right-click the row to try another source.'), ok=ok, total=1)
 
 

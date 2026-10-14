@@ -390,6 +390,7 @@ struct Song {
     samples: Vec<String>,
     sample_summary: String,
     plugins_missing: Vec<String>,
+    plugins_32bit: Vec<String>, // installed, but only the 32-bit file: FL bridges it
     plugins_unchecked: bool, // indexed by an old scanner without plugin paths: not checked yet
     samples_fetchable: Vec<String>, // missing or moved samples (file names) that Fetch samples can bring next to the project
     versions: Vec<Row>,
@@ -468,12 +469,13 @@ fn plugin_stem(file: &str) -> String {
     format!("{n}.{ext}")
 }
 
-/// File names (lower-case) of every plugin FL's own plugin database lists as installed on this PC.
+/// File names (lower-case) of every plugin FL's own plugin database lists as installed on this PC,
+/// with whether a 64-bit file is among them (a 32-bit one only runs through FL's bridge).
 /// Re-read every few minutes, so plugins installed while the panel runs show up without a restart.
-fn fl_installed_files() -> std::sync::Arc<std::collections::HashSet<String>> {
+fn fl_installed_files() -> std::sync::Arc<std::collections::HashMap<String, bool>> {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
-    static CACHE: Mutex<Option<(Instant, Arc<std::collections::HashSet<String>>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(Instant, Arc<std::collections::HashMap<String, bool>>)>> = Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, set)) = guard.as_ref() {
         if at.elapsed() < Duration::from_secs(180) {
@@ -485,9 +487,9 @@ fn fl_installed_files() -> std::sync::Arc<std::collections::HashSet<String>> {
     set
 }
 
-fn read_fl_installed_files() -> std::collections::HashSet<String> {
+fn read_fl_installed_files() -> std::collections::HashMap<String, bool> {
     {
-        let mut set = std::collections::HashSet::new();
+        let mut set = std::collections::HashMap::new();
         let Ok(profile) = std::env::var("USERPROFILE") else { return set };
         let base = std::path::PathBuf::from(profile).join("Documents\\Image-Line\\FL Studio\\Presets\\Plugin database\\Installed");
         let mut dirs = vec![base];
@@ -501,16 +503,36 @@ fn read_fl_installed_files() -> std::collections::HashSet<String> {
                     || p.file_name().map(|x| x.eq_ignore_ascii_case(".Plugins.ini")).unwrap_or(false)
                 {
                     if let Ok(text) = std::fs::read_to_string(&p) {
-                        for line in text.lines().filter(|l| l.starts_with("ps_file_filename_")) {
-                            if let Some((_, v)) = line.split_once('=') {
-                                let v = v.trim();
+                        // ps_file_filename_N / ps_file_bitsize_N pairs, per [section] of the ini
+                        let mut names: Vec<(String, String)> = Vec::new();
+                        let mut bits: Vec<(String, bool)> = Vec::new();
+                        let flush = |names: &mut Vec<(String, String)>, bits: &mut Vec<(String, bool)>, set: &mut std::collections::HashMap<String, bool>| {
+                            for (idx, v) in names.drain(..) {
                                 // the database may be a copy from another PC (synced Documents):
                                 // only files that are really here count. %FLPath% ones are FL's own.
-                                if v.contains('%') || std::path::Path::new(v).exists() {
-                                    set.insert(v.rsplit(SEP).next().unwrap_or(v).to_lowercase());
+                                if v.contains('%') || std::path::Path::new(&v).exists() {
+                                    let is64 = v.contains('%') || v.to_lowercase().ends_with(".vst3")
+                                        || bits.iter().find(|(i, _)| *i == idx).map(|(_, b)| *b).unwrap_or(true);
+                                    let e = set.entry(v.rsplit(SEP).next().unwrap_or(&v).to_lowercase()).or_insert(false);
+                                    *e = *e || is64;
+                                }
+                            }
+                            bits.clear();
+                        };
+                        for line in text.lines() {
+                            if line.starts_with('[') {
+                                flush(&mut names, &mut bits, &mut set);
+                            } else if let Some(rest) = line.strip_prefix("ps_file_filename_") {
+                                if let Some((idx, v)) = rest.split_once('=') {
+                                    names.push((idx.to_string(), v.trim().to_string()));
+                                }
+                            } else if let Some(rest) = line.strip_prefix("ps_file_bitsize_") {
+                                if let Some((idx, v)) = rest.split_once('=') {
+                                    bits.push((idx.to_string(), v.trim() == "64"));
                                 }
                             }
                         }
+                        flush(&mut names, &mut bits, &mut set);
                     }
                 }
             }
@@ -599,31 +621,53 @@ fn load_project(s: &mut Song, file_name: &str) {
             // saved it, so only the file name counts: FL's plugin database, or the scanner's table
             // of plugin files found in this PC's VST folders (plugin_files, refreshed every scan
             // and after each fetch). FL's own plugins always exist.
+            // A copy counts fully only when it is 64-bit (or VST3): a 32-bit-only plugin goes
+            // through FL's bridge, which is what fails on a PC that never had the plugin installed.
             let installed = fl_installed_files();
-            let local: std::collections::HashSet<String> = query("SELECT file FROM plugin_files WHERE ?1 = ''", "")
-                .into_iter()
-                .filter_map(|r| r.into_iter().next())
-                .collect();
-            s.plugins_missing = items
-                .iter()
-                .filter(|p| p["path"].as_str().map(|q| {
-                    let low = q.to_lowercase();
-                    let file = low.rsplit(SEP).next().unwrap_or(&low).to_string();
-                    let stem = plugin_stem(&file);
-                    let fl_own = low.contains("\\image-line\\") || low.contains("\\plugins\\fruity\\") || file.starts_with("fruity ");
-                    !fl_own && !installed.contains(&file) && !local.contains(&file)
-                        && !installed.iter().chain(local.iter()).any(|k| plugin_stem(k) == stem)
-                }).unwrap_or(false))
-                .filter_map(|p| p["name"].as_str().map(str::to_string))
-                .collect();
+            let mut known: std::collections::HashMap<String, bool> = (*installed).clone();
+            for r in query("SELECT file, machine FROM plugin_files WHERE ?1 = ''", "") {
+                let is64 = r.get(1).map(|m| m == "34404").unwrap_or(false) || r[0].ends_with(".vst3");
+                let e = known.entry(r[0].clone()).or_insert(false);
+                *e = *e || is64;
+            }
+            s.plugins_missing.clear();
+            s.plugins_32bit.clear();
+            for p in items.iter() {
+                let (Some(name), Some(q)) = (p["name"].as_str(), p["path"].as_str()) else { continue };
+                let low = q.to_lowercase();
+                let file = low.rsplit(SEP).next().unwrap_or(&low).to_string();
+                let stem = plugin_stem(&file);
+                let fl_own = low.contains("\\image-line\\") || low.contains("\\plugins\\fruity\\") || file.starts_with("fruity ");
+                if fl_own {
+                    continue;
+                }
+                let copies: Vec<bool> = known.iter().filter(|(k, _)| **k == file || plugin_stem(k) == stem).map(|(_, b)| *b).collect();
+                if copies.iter().any(|b| *b) {
+                    continue;
+                } else if copies.is_empty() {
+                    s.plugins_missing.push(name.to_string());
+                } else {
+                    s.plugins_32bit.push(name.to_string());
+                }
+            }
             s.plugins_unchecked = items.iter().any(|p| p["vst"].as_bool() == Some(true) && p.get("path").is_none());
             if !names.is_empty() {
-                s.plugins = if s.plugins_unchecked {
-                    format!("Plugins ({}){DOT}not checked yet (rescan pending){DOT}{}", names.len(), names.join(", "))
-                } else if s.plugins_missing.is_empty() {
+                let mut parts = vec![format!("Plugins ({})", names.len())];
+                if s.plugins_unchecked {
+                    parts.push("not checked yet (rescan pending)".into());
+                } else {
+                    if !s.plugins_missing.is_empty() {
+                        parts.push(format!("{} MISSING: {}", s.plugins_missing.len(), s.plugins_missing.join(", ")));
+                    }
+                    if !s.plugins_32bit.is_empty() {
+                        parts.push(format!("{} ONLY 32-BIT HERE: {}", s.plugins_32bit.len(), s.plugins_32bit.join(", ")));
+                    }
+                }
+                s.plugins = if parts.len() == 1 {
                     format!("Plugins ({}): {}", names.len(), names.join(", "))
                 } else {
-                    format!("Plugins ({}){DOT}{} MISSING: {}{DOT}{}", names.len(), s.plugins_missing.len(), s.plugins_missing.join(", "), names.join(", "))
+                    parts.push(names.join(", "));
+                    parts.join(DOT)
                 };
             }
         }
@@ -701,6 +745,7 @@ fn load(path: &str) -> Song {
         samples: Vec::new(),
         sample_summary: "SAMPLES: not indexed yet (rescan runs every 30 min)".into(),
         plugins_missing: Vec::new(),
+        plugins_32bit: Vec::new(),
         plugins_unchecked: false,
         samples_fetchable: Vec::new(),
         versions: Vec::new(),
@@ -1350,7 +1395,7 @@ unsafe fn build(hwnd: HWND, s: &Song) {
     button(hwnd, "Folder", ID_FOLDER, s.font);
     button(hwnd, "\u{2605} Bookmark", ID_BOOKMARK, s.font);
     let fetch = button(hwnd, if s.plugins_unchecked { "Check plugins" } else { "Fetch plugins" }, ID_FETCH, s.font);
-    if s.plugins_missing.is_empty() && !s.plugins_unchecked {
+    if s.plugins_missing.is_empty() && s.plugins_32bit.is_empty() && !s.plugins_unchecked {
         let _ = EnableWindow(fetch, false);
     }
     let fs = button(hwnd, "Fetch samples", ID_FETCHSAMPLES, s.font);
@@ -1561,7 +1606,7 @@ fn lit(s: &Song, id: i32) -> Option<u32> {
         _ if (ID_STATUS..ID_STATUS + 5).contains(&id) => (STATUSES[(id - ID_STATUS) as usize] == s.status).then_some(STATUS_COLORS[(id - ID_STATUS) as usize]),
         _ if (ID_RATING..ID_RATING + 5).contains(&id) => (s.rating == (id - ID_RATING + 1) as u32).then_some(rgb(255, 200, 60)),
         ID_BOOKMARK => s.bookmark.then_some(C_ACCENT),
-        ID_FETCH => (!s.plugins_missing.is_empty()).then_some(C_RED).or(s.plugins_unchecked.then_some(rgb(255, 200, 60))),
+        ID_FETCH => (!s.plugins_missing.is_empty()).then_some(C_RED).or((s.plugins_unchecked || !s.plugins_32bit.is_empty()).then_some(rgb(255, 200, 60))),
         ID_FETCHSAMPLES => (!s.samples_fetchable.is_empty()).then_some(C_RED),
         ID_BOOKMARKS => s.want_bookmarks.then_some(C_ACCENT),
         ID_LIBRARY => s.want_library.then_some(C_ACCENT),
@@ -1668,7 +1713,7 @@ unsafe fn command(hwnd: HWND, s: &mut Song, id: i32, code: u32) {
             }
         }
         ID_FIND => flctl(&["versions", &s.path]),
-        ID_FETCH => open_fetch_window(&s.path, &s.plugins_missing, s.dpi, "plugins"),
+        ID_FETCH => open_fetch_window(&s.path, &[s.plugins_missing.clone(), s.plugins_32bit.clone()].concat(), s.dpi, "plugins"),
         ID_FETCHSAMPLES => open_fetch_window(&s.path, &s.samples_fetchable, s.dpi, "samples"),
         ID_GETFL => flctl(&["getfl", &s.path]),
         ID_FOLDER => reveal(&s.path),
@@ -1938,6 +1983,7 @@ fn fetch_status_label(status: &str) -> String {
         "notfound" => "\u{2717} not found".into(),
         "installer" => "\u{2717} not found \u{2014} installer found".into(),
         "offline" => "\u{2717} source PC offline".into(),
+        "only32" => "\u{2717} no 64-bit copy anywhere".into(),
         "error" => "\u{2717} failed".into(),
         other => other.to_string(),
     }
@@ -1946,7 +1992,7 @@ fn fetch_status_label(status: &str) -> String {
 fn fetch_status_color(status: &str) -> u32 {
     match status {
         "ok" => rgb(80, 205, 120),
-        "licensed" | "offline" | "installer" | "admin" => rgb(255, 200, 60),
+        "licensed" | "offline" | "installer" | "admin" | "only32" => rgb(255, 200, 60),
         "notfound" | "error" => C_RED,
         "found" | "copying" => C_TEXT,
         _ => C_DIM,

@@ -344,7 +344,7 @@ def refresh_plugin_files(db, cfg):
     known = fl_known_plugins()
     rows = {}
     for path in known:
-        rows[ntpath.basename(path)] = (path, None)
+        rows[ntpath.basename(path)] = (path, None if '%' in path else pe_machine(path))
     try:
         found = local_plugin_hits(cfg, names, strict=True)
     except (OSError, ValueError):
@@ -480,6 +480,40 @@ def expand_sample(sp):
     return os.path.expandvars(sp)
 
 
+# Audio FL itself wrote into its data folder: rendered patterns, recordings, sliced beats. Unlike
+# the packs next to them these are the user's own files, and a fresh FL has none of them.
+# FL 12 kept them in <FL>\Data\Patches\<sub>; FL 20+ in Documents\Image-Line\FL Studio\Audio\<sub>.
+FL_USER_AUDIO = {'rendered': 'Rendered', 'recorded': 'Recorded', 'sliced beats': 'Sliced audio', 'sliced audio': 'Sliced audio',
+                 'clipboard files': 'Clipboard files', 'edited': 'Edited'}
+FL_USER_AUDIO_RE = re.compile(r'\\(?:patches|audio)\\(' + '|'.join(re.escape(k) for k in FL_USER_AUDIO) + r')\\', re.I)
+
+
+def fl_user_audio_candidates(sp):
+    """Where a sample FL stored in its own data folder would be on this PC, if it is here at all:
+    [] when the path is not one of those."""
+    m = FL_USER_AUDIO_RE.search(sp)
+    if not m:
+        return []
+    sub, rest = FL_USER_AUDIO[m.group(1).lower()], sp[m.end():]
+    out = [os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Audio', sub, rest)]
+    for d in fl_patches_dirs():
+        out.append(os.path.join(d, m.group(1), rest))
+    return out
+
+
+_FL_PATCHES = None
+
+
+def fl_patches_dirs():
+    """<FL>\\Data\\Patches of every installed FL version (found once per process)."""
+    global _FL_PATCHES
+    if _FL_PATCHES is None:
+        _FL_PATCHES = []
+        for pf in (os.environ.get('ProgramFiles', r'C:\Program Files'), os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')):
+            _FL_PATCHES += glob.glob(os.path.join(pf, 'Image-Line', 'FL Studio*', 'Data', 'Patches'))
+    return _FL_PATCHES
+
+
 def resolve_samples(samples, audio, zip_names, directory=None):
     out, missing, moved = [], 0, 0
     if audio is None:  # single-file index from the Explorer menu; the next scan resolves them
@@ -492,6 +526,13 @@ def resolve_samples(samples, audio, zip_names, directory=None):
             status = 'inzip'
         elif directory and (directory.lower() + '\\' + name) in audio.paths:
             status = 'ok'  # next to the project (fetched there, or kept there): FL looks there first
+        elif cands := fl_user_audio_candidates(sp):
+            # FL's own rendered/recorded audio: must exist in this PC's FL data folders
+            if any(c.lower() in audio.paths or os.path.exists(c) for c in cands):
+                status = 'ok'
+            else:
+                found = audio.best(name, cands[0])
+                status = 'moved' if found else 'missing'
         elif (low.startswith(('%flstudiofactorydata%', '%flstudiodata%', '\\patches\\', 'patches\\'))
               or FACTORY_SAMPLE_RE.search(low)):
             status = 'factory'
@@ -708,6 +749,11 @@ def scan(recheck=False):
     # rows written by an older scanner that did not store plugin paths: parse again
     stale = {r[0] for r in db.execute('SELECT f.path FROM files f JOIN projects p ON p.hash = f.hash '
                                       'WHERE p.plugins LIKE \'%"vst": true%\' AND p.plugins NOT LIKE \'%"path"%\'')}
+    # ...or that filed FL's own rendered/recorded audio under "factory": check those again
+    stale |= {r[0] for r in db.execute('SELECT f.path FROM files f JOIN projects p ON p.hash = f.hash '
+                                       'WHERE p.samples LIKE \'%"status": "factory"%\' AND ('
+                                       'p.samples LIKE \'%\\\\Rendered\\\\%\' OR p.samples LIKE \'%\\\\Recorded\\\\%\' '
+                                       'OR p.samples LIKE \'%\\\\Sliced beats\\\\%\' OR p.samples LIKE \'%\\\\Sliced audio\\\\%\')')}
     new_flps = [p for p, v in flps.items() if recheck or known.get(p) != v or p in stale]
     new_flps.sort(key=lambda p: p.startswith('\\\\'))  # local drives first, slow shares last
     new_zips = []

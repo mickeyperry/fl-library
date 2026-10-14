@@ -32,6 +32,9 @@ list. It never moves or changes your project files.
     them with `vst_dir`, `vst_dir_x86`, `vst3_dir`). FL finds plugins by file name there, so the
     project loads; the report says what was copied from where and what could not be found. Plugins
     that need their installer get a list of installer candidates found on your drives instead.
+    A plugin that is here only as a 32-bit file is listed too ("only 32-bit here"): FL 64 Bit has
+    to bridge it, which is what tends to fail on a PC that never had the plugin installed, so the
+    fetch looks for a 64-bit copy and prefers 64-bit copies in general.
   - **Fetch samples:** for a project with missing or moved samples, finds each one, the song's own
     FL project zips first (the most faithful copies), then the song's folders, then every drive,
     share and other PC, and copies the ones you tick next to the `.flp`, where FL looks for them.
@@ -140,6 +143,13 @@ anyone on that network list your file names, so only do it on a network you trus
   skipped (the last known state is kept).
 - Copying a plugin file does not license it. Waves, UAD, Native Instruments, iLok-protected and
   similar plugins still need their installer; the fetch report marks those.
+- After fetching plugins, run FL's plugin scan once with **Verify plugins** ticked (Options >
+  Manage plugins > Find plugins). FL matches a project's plugin by the name the plugin reports,
+  and only a verified scan learns that name; an unverified scan files the copy under its file
+  name and the project still says the plugin is missing.
+- Audio FL itself saved into its data folder (rendered patterns, recordings, sliced beats under
+  `Patches\Rendered`, `Recorded`, `Sliced beats`, or `Audio\...` in FL 20+) counts as a real
+  sample, not factory content: a fresh FL has none of it. Fetch samples looks for those too.
 - Shared data (`sync_dir`) resolves conflicts by newest change, so keep the PCs' clocks in sync.
 - The panel's project data refreshes with each scan (every 30 minutes, or right-click a project →
   FL Library → **Rescan library now**).
