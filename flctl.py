@@ -27,6 +27,29 @@ def song_for(db, path):
     return row[0]
 
 
+def db_path(db, path):
+    """The library row that stands for this file: itself for an .flp, the project inside for an
+    FL project zip (rows are keyed "zip|member")."""
+    if path.lower().endswith('.zip'):
+        row = db.execute('SELECT path FROM files WHERE container = ? COLLATE NOCASE ORDER BY is_autosave, mtime DESC LIMIT 1',
+                         (path,)).fetchone()
+        if row:
+            return row[0]
+    return path
+
+
+def parse_any(path):
+    """Parse an .flp, or the project inside an FL zip ("zip|member", or the zip's first .flp)."""
+    import zipfile
+    zpath, _sep, member = path.partition('|')
+    if not zpath.lower().endswith('.zip'):
+        return scanner.flparse.parse_file(path)
+    with zipfile.ZipFile(zpath) as z:
+        if not member:
+            member = next(n for n in z.namelist() if n.lower().endswith('.flp'))
+        return scanner.flparse.parse_buffer(z.read(member))
+
+
 def ask(title, prompt, initial):
     import tkinter
     from tkinter import simpledialog
@@ -76,7 +99,7 @@ def show_samples(path):
     db = scanner.connect()
     song_for(db, path)
     row = db.execute('SELECT p.samples FROM files f JOIN projects p ON p.hash = f.hash '
-                     'WHERE f.path = ? COLLATE NOCASE', (path,)).fetchone()
+                     'WHERE f.path = ? COLLATE NOCASE', (db_path(db, path),)).fetchone()
     samples = json.loads(row[0] or '[]') if row else []
     order = {'missing': 0, 'moved': 1, 'unchecked': 2, 'ok': 3, 'inzip': 4, 'factory': 5}
     samples.sort(key=lambda s: (order.get(s['status'], 9), s['path'].lower()))
@@ -192,19 +215,22 @@ def everything_hits(url, search, limit=50):
 
 
 def project_plugins(db, flp):
+    key = db_path(db, flp)
     row = db.execute('SELECT p.plugins FROM files f JOIN projects p ON p.hash = f.hash '
-                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+                     'WHERE f.path = ? COLLATE NOCASE', (key,)).fetchone()
     plugins = json.loads(row[0]) if row and row[0] else []
     if not plugins or not any('path' in p for p in plugins):
         # not indexed yet, or indexed before plugin paths were stored: parse it now and store the
         # result so the panel shows the check from here on
         try:
+            if key.lower().endswith('.zip') or '|' in key:
+                raise ValueError('zip: parse without storing')
             scanner.index_one(db, flp)
             row = db.execute('SELECT p.plugins FROM files f JOIN projects p ON p.hash = f.hash '
                              'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
             plugins = json.loads(row[0]) if row and row[0] else []
         except Exception:
-            plugins = scanner.flparse.parse_file(flp)['plugins']
+            plugins = parse_any(key)['plugins']
     return [p for p in plugins if p.get('path')]
 
 
@@ -888,12 +914,13 @@ def get_fl(flp):
     flp = os.path.abspath(flp)
     cfg = scanner.load_config()
     db = scanner.connect()
+    key = db_path(db, flp)
     row = db.execute('SELECT p.version FROM files f JOIN projects p ON p.hash = f.hash '
-                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+                     'WHERE f.path = ? COLLATE NOCASE', (key,)).fetchone()
     db.close()
     version = (row[0] if row else '') or ''
     if not version:
-        version = scanner.flparse.parse_file(flp).get('version') or ''
+        version = parse_any(key).get('version') or ''
     if not version:
         ctypes.windll.user32.MessageBoxW(None, 'This project does not say which FL version made it.', 'FL Library', 0x30)
         return
@@ -999,11 +1026,12 @@ def update(check_only=False):
 def project_samples(db, flp):
     """[(stored path, status, found)] for the project's samples that FL will not find: missing, moved
     (a copy elsewhere on this PC) or never checked and not at their path."""
+    key = db_path(db, flp)
     row = db.execute('SELECT p.samples FROM files f JOIN projects p ON p.hash = f.hash '
-                     'WHERE f.path = ? COLLATE NOCASE', (flp,)).fetchone()
+                     'WHERE f.path = ? COLLATE NOCASE', (key,)).fetchone()
     items = json.loads(row[0]) if row and row[0] else []
     if not items:
-        items = [{'path': sp, 'status': 'unchecked', 'found': None} for sp in scanner.flparse.parse_file(flp)['samples']]
+        items = [{'path': sp, 'status': 'unchecked', 'found': None} for sp in parse_any(key)['samples']]
     out = []
     here = os.path.dirname(flp)
     for it in items:
@@ -1023,8 +1051,8 @@ def song_zips(db, flp):
     """FL project zips that belong to this song or sit in its folder: the most relevant place for
     its samples. Best first."""
     here = os.path.dirname(flp).lower()
-    row = db.execute('SELECT song_key FROM files WHERE path = ? COLLATE NOCASE', (flp,)).fetchone()
-    zips = []
+    row = db.execute('SELECT song_key FROM files WHERE path = ? COLLATE NOCASE', (db_path(db, flp),)).fetchone()
+    zips = [flp] if flp.lower().endswith('.zip') else []
     if row:
         zips += [r[0] for r in db.execute('SELECT DISTINCT container FROM files WHERE song_key = ? AND container IS NOT NULL '
                                           'ORDER BY mtime DESC', (row[0],))]

@@ -38,6 +38,7 @@ struct State {
     child: HWND,
     rect: RECT,
     checked: (String, bool), // last folder tested for projects
+    zip_checked: (String, bool), // last zip tested for a project inside
     enabled: bool,           // tray toggle; remembered in HKCU\Software\FLLibrary\Enabled
     taskbar_created: u32,    // Explorer restarted: the tray icon must be added again
 }
@@ -142,10 +143,20 @@ fn has_projects(st: &mut State, dir: &str) -> bool {
     st.checked.1
 }
 
+/// A zip the library found an FL project in (zipped projects are indexed like loose .flp files).
+fn is_fl_zip(st: &mut State, zip: &str) -> bool {
+    if st.zip_checked.0 != zip {
+        let found = !query("SELECT 1 FROM files WHERE container = ?1 COLLATE NOCASE LIMIT 1", zip).is_empty();
+        st.zip_checked = (zip.to_string(), found);
+    }
+    st.zip_checked.1
+}
+
 /// What the panel should show for this Explorer view; None hides it (normal preview shows).
 fn wanted(st: &mut State, v: &View) -> Option<String> {
     if let Some(sel) = &v.selected {
-        if sel.to_lowercase().ends_with(".flp") {
+        let low = sel.to_lowercase();
+        if low.ends_with(".flp") || (low.ends_with(".zip") && is_fl_zip(st, sel)) {
             return Some(sel.clone());
         }
         let is_dir = std::fs::metadata(sel).map(|m| m.is_dir()).unwrap_or(false);
@@ -424,6 +435,7 @@ fn main() -> Result<()> {
             child: HWND::default(),
             rect: RECT::default(),
             checked: (String::new(), false),
+            zip_checked: (String::new(), false),
             enabled: read_enabled(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });

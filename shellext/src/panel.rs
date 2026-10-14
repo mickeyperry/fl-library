@@ -569,13 +569,58 @@ fn load_folder(s: &mut Song) {
 
 fn load_project(s: &mut Song, file_name: &str) {
     let path = s.path.clone();
-    let mut buf = Vec::new();
-    if let Ok(f) = std::fs::File::open(&path) {
-        let _ = f.take(HEAD_BYTES).read_to_end(&mut buf);
-    }
     let mut parts: Vec<String> = Vec::new();
     let mut line2: Vec<String> = Vec::new();
-    if let Some(h) = parse_head(&buf) {
+    // An FL project zip: the library indexes the .flp inside it (row path "zip|member"), and that
+    // row stands in for the file. Header values come from the index, the file being in the zip.
+    let is_zip = path.to_lowercase().ends_with(".zip");
+    let members = if is_zip {
+        query("SELECT path, name FROM files WHERE container = ?1 COLLATE NOCASE ORDER BY is_autosave, mtime DESC", &path)
+    } else {
+        Vec::new()
+    };
+    let path = members.first().map(|m| m[0].clone()).unwrap_or(path);
+    let mut buf = Vec::new();
+    if !is_zip {
+        if let Ok(f) = std::fs::File::open(&path) {
+            let _ = f.take(HEAD_BYTES).read_to_end(&mut buf);
+        }
+    }
+    if is_zip {
+        let h = query(
+            "SELECT IFNULL(p.version,''), IFNULL(p.bpm,''), IFNULL(p.channels,0), IFNULL(p.hours,''), IFNULL(p.title,''), \
+             IFNULL(p.author,''), IFNULL(p.genre,'') FROM files f JOIN projects p ON p.hash = f.hash \
+             WHERE f.path = ?1 COLLATE NOCASE LIMIT 1",
+            &path,
+        );
+        match h.first() {
+            Some(h) if !h[0].is_empty() => {
+                parts.push(format!("FL {}", h[0]));
+                s.version = h[0].clone();
+                if let Ok(bpm) = h[1].parse::<f64>() {
+                    parts.push(if bpm.fract() == 0.0 { format!("{} BPM", bpm as u32) } else { format!("{bpm:.1} BPM") });
+                }
+                if h[2].parse::<u32>().unwrap_or(0) > 0 {
+                    parts.push(format!("{} channels", h[2]));
+                }
+                if let Ok(hours) = h[3].parse::<f64>() {
+                    parts.push(format!("{hours:.1} h worked"));
+                }
+                for (label, v) in [("Title", &h[4]), ("Author", &h[5]), ("Genre", &h[6])] {
+                    if !v.is_empty() {
+                        line2.push(format!("{label}: {v}"));
+                    }
+                }
+            }
+            _ => parts.push("zipped project not indexed yet (rescan runs every 30 min)".into()),
+        }
+        let names: Vec<&str> = members.iter().map(|m| m[1].as_str()).collect();
+        parts.push(match names.len() {
+            0 => "FL project zip".to_string(),
+            1 => format!("zip holding {}", names[0]),
+            n => format!("zip holding {n} projects: {}", names.join(", ")),
+        });
+    } else if let Some(h) = parse_head(&buf) {
         parts.push(format!("FL {}", h.version));
         s.version = h.version.clone();
         if let Some(bpm) = h.bpm {

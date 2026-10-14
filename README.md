@@ -12,6 +12,9 @@ list. It never moves or changes your project files.
   - **Selected `.flp`:** FL version, BPM, channels, hours worked, creation date, plugins, samples
     (missing ones are flagged, with where Everything found moved copies), and every version of the
     song.
+  - **Selected FL project `.zip`:** the same panel for the project inside it (FL version, BPM,
+    plugins, samples, versions, all the buttons: FL opens zipped projects directly, and Fetch
+    samples takes the zip's own copies first).
   - **Selected folder:** the projects inside it, as a sortable table.
   - **Folder with no projects:** the whole **Library**, a tree of every project grouped by
     creation year, month and song.
