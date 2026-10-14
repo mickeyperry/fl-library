@@ -301,10 +301,14 @@ def plugin_sources(cfg, name, path, local_copies=()):
         scored.append((score, full, where))
     scored.sort(key=lambda t: -t[0])
     if want64:  # a 64-bit copy beats any 32-bit one: FL 64 Bit loads it without the bridge.
-        top = []  # (bitness needs the file header read: only for the ones in the running)
+        from concurrent.futures import ThreadPoolExecutor
+        top = []  # (bitness needs the file header read: only for the ones in the running, in parallel:
+        todo = [full for _s, full, _w in scored[:40] if full.lower() not in _MACHINE]  # backup drives are slow)
+        if todo:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for full, machine in zip(todo, pool.map(pe_machine, todo)):
+                    _MACHINE[full.lower()] = machine
         for score, full, where in scored[:40]:
-            if full.lower() not in _MACHINE:
-                _MACHINE[full.lower()] = pe_machine(full)
             machine = _MACHINE[full.lower()]
             top.append((score + (10 if machine == PE_X64 else 1 if machine == PE_X86 else 0), full, where))
         top.sort(key=lambda t: -t[0])
@@ -574,6 +578,8 @@ def fetch_plugins(flp, json_out=False, search_only=False):
             live = [s for s, w in sources if w != 'offline']
             if live:
                 bits = bits_label(live[0])
+                if bits == '32-bit':
+                    bits = '32-bit only: FL 64 Bit has to bridge it'
                 emit(plugin=name, status='found',
                      detail=f'{len(live)} cop{"y" if len(live) == 1 else "ies"}, best: {live[0]}' + (f'   ({bits})' if bits else ''),
                      sources=[s for s, _w in sources[:20]])
