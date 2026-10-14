@@ -324,22 +324,30 @@ def plugin_sources(cfg, name, path, local_copies=()):
             score += 2  # a real install, not a backup copy
         if where == 'this PC':
             score += 1
-        scored.append((score, full, where))
+        scored.append((score, full, where, size))
     scored.sort(key=lambda t: -t[0])
     if want64:  # a 64-bit copy beats any 32-bit one: FL 64 Bit loads it without the bridge.
+        # Bitness needs the file header, and opening files on a backup drive over the network is
+        # the slow part of the whole search (Everything itself answers instantly). Copies of the
+        # same size are the same file, so read one header per size, local copies first, in parallel.
         from concurrent.futures import ThreadPoolExecutor
-        top = []  # (bitness needs the file header read: only for the ones in the running, in parallel:
-        todo = [full for _s, full, _w in scored[:40] if full.lower() not in _MACHINE]  # backup drives are slow)
-        if todo:
+        groups = {}  # size -> [paths]
+        for _s, full, _w, size in scored[:60]:
+            if full.lower() not in _MACHINE:
+                groups.setdefault(size or full.lower(), []).append(full)
+        reps = [min(paths, key=lambda p: (p.startswith('\\\\'), paths.index(p))) for paths in groups.values()]
+        if reps:
             with ThreadPoolExecutor(max_workers=8) as pool:
-                for full, machine in zip(todo, pool.map(pe_machine, todo)):
-                    _MACHINE[full.lower()] = machine
-        for score, full, where in scored[:40]:
-            machine = _MACHINE[full.lower()]
-            top.append((score + (10 if machine == PE_X64 else 1 if machine == PE_X86 else 0), full, where))
+                for rep, machine in zip(reps, pool.map(pe_machine, reps)):
+                    for full in groups[next(k for k, v in groups.items() if rep in v)]:
+                        _MACHINE[full.lower()] = machine
+        top = []
+        for score, full, where, size in scored[:60]:
+            machine = _MACHINE.get(full.lower())
+            top.append((score + (10 if machine == PE_X64 else 1 if machine == PE_X86 else 0), full, where, size))
         top.sort(key=lambda t: -t[0])
-        scored = top + scored[40:]
-    return [(full, where) for _, full, where in scored] + offline
+        scored = top + scored[60:]
+    return [(full, where) for _, full, where, _size in scored] + offline
 
 
 def bits_label(path):
