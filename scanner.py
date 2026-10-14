@@ -659,6 +659,7 @@ def run_pool(db, fn, items, path_of, on_result, label, progress, stall=90):
     (its files are retried next time) instead of hanging everything."""
     workers = max(2, min(8, (os.cpu_count() or 4) - 1))
     total, done_n = len(items), 0
+    last_commit = time.time()
     while items:
         pool = ProcessPoolExecutor(workers)
         futs = {pool.submit(fn, it): it for it in items}
@@ -673,8 +674,10 @@ def run_pool(db, fn, items, path_of, on_result, label, progress, stall=90):
                 on_result(futs[f], f.result())
                 done_n += 1
                 if done_n % 500 == 0:
-                    db.commit()
                     progress(f'{label}: {done_n:,}/{total:,}')
+            if time.time() - last_commit > 3:  # short transactions: the panel and fetches write too
+                db.commit()
+                last_commit = time.time()
         db.commit()
         if not stalled:
             pool.shutdown()

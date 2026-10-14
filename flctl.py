@@ -502,6 +502,19 @@ def trace(msg):
         pass
 
 
+def note_plugin_file(name, dest):
+    """Record the new copy for the panel's plugin check, best effort: a scan in progress holds the
+    database for a while, and the next scan records the file anyway. Never waits on it."""
+    import sqlite3
+    try:
+        db = sqlite3.connect(scanner.DB_PATH, timeout=1)
+        db.execute('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)', (os.path.basename(dest).lower(), dest, pe_machine(dest)))
+        db.commit()
+        db.close()
+    except sqlite3.Error as e:
+        trace(f'copy {name}: plugin_files not updated now ({e}); the next scan will')
+
+
 def copy_batch(cfg, db, batch, emit):
     """Copy each plugin from the best readable source; one event per step. batch: [(name, stored
     path, [(src, where)])]. Returns (ok count, report lines)."""
@@ -525,9 +538,7 @@ def copy_batch(cfg, db, batch, emit):
             try:
                 note = copy_plugin(src, dest, progress)
                 trace(f'copy {name}: done {note}')
-                db.execute('INSERT OR REPLACE INTO plugin_files VALUES(?,?,?)',
-                           (os.path.basename(dest).lower(), dest, pe_machine(dest)))
-                db.commit()
+                note_plugin_file(name, dest)
                 lic = licensed_note(src)
                 emit(plugin=name, status='licensed' if lic else 'ok', detail=f'{dest}   (from {src})' + (f'   {note}' if note else ''))
                 report.append(f'OK  {name}\n      -> {dest}\n      from {src}'
@@ -810,16 +821,20 @@ def fetch_one(flp, name, src, json_out=True):
 def fetch_copy_elevated(plan_file):
     """The elevated half of fetch_plugins: copy everything in the plan, report to <plan>.out."""
     plan = json.load(open(plan_file, encoding='utf-8'))
-    cfg = scanner.load_config()
-    db = scanner.connect()
     with open(plan_file + '.out', 'w', encoding='utf-8') as out:
         def emit(**ev):
             out.write(json.dumps(ev) + '\n')
             out.flush()
-        _ok, lines = copy_batch(cfg, db, [(n, p, [tuple(s) for s in srcs]) for n, p, srcs in plan], emit)
-        for line in lines:
-            emit(report=line)
-    db.close()
+        try:
+            cfg = scanner.load_config()
+            _ok, lines = copy_batch(cfg, None, [(n, p, [tuple(s) for s in srcs]) for n, p, srcs in plan], emit)
+            for line in lines:
+                emit(report=line)
+        except Exception as e:  # noqa: BLE001 - whatever it was, the window must hear about it
+            trace(f'fetch_copy_elevated: {e!r}')
+            for n, _p, _s in plan:
+                emit(plugin=n, status='error', detail=f'copy helper failed: {e}')
+            emit(report=f'XX  copy helper failed: {e}')
 
 
 def run_elevated_and_wait(exe, params, poll=None):
