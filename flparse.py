@@ -99,6 +99,7 @@ def parse_buffer(buf):
         'plugins': [], 'samples': [], 'truncated': False,
     }
     utf16 = False
+    short172 = False
     tempo_old = tempo_fine = None
     chan_ctx = 0  # events left in which a 201 still belongs to the channel just opened
     pending = None  # plugin being described by 201/203/213
@@ -131,8 +132,9 @@ def parse_buffer(buf):
             size = 2
         elif eid < 192:
             size = 4
-            # FL 25+ writes event 172 with a 3-byte payload, directly followed by a text event (192)
-            if eid == 172 and pos + 3 < end and buf[pos + 3] == 192:
+            # FL 25+ writes event 172 with a 3-byte payload (seen before a text event and, in
+            # FL 2026 autosaves, in the middle of the stream, so the version decides)
+            if eid == 172 and (short172 or (pos + 3 < end and buf[pos + 3] == 192)):
                 size = 3
         else:
             size = shift = 0
@@ -158,6 +160,7 @@ def parse_buffer(buf):
             v = bytes(buf[start:pos]).decode('ascii', errors='replace').strip('\0').strip()
             info['version'] = v
             utf16 = _version_tuple(v)[:2] >= (11, 5)
+            short172 = _version_tuple(v)[:1] >= (25,)
         elif eid == EV_BUILD:
             info['build'] = struct.unpack_from('<I', buf, start)[0]
         elif eid == EV_TEMPO:

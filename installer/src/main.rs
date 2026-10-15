@@ -227,11 +227,30 @@ fn file_version(path: &Path) -> Option<(u32, u32, u32, u32)> {
     }
 }
 
+/// Is FL Library installed already (an update), and did the user keep "start with Windows"?
+fn installed() -> bool {
+    reg_get(HKEY_LOCAL_MACHINE, KEY_UNINSTALL, "DisplayVersion").is_some()
+}
+
+fn startup_wanted() -> bool {
+    !installed() || reg_get(HKEY_LOCAL_MACHINE, KEY_RUN, "FLLibraryPanel").is_some()
+}
+
 /// Every installed FL Studio by major version: (major, exe), newest build of each major.
+/// Program Files on every drive: FL is often installed away from C:.
 fn find_fl() -> Vec<(u32, PathBuf)> {
     let mut best: std::collections::BTreeMap<u32, ((u32, u32, u32, u32, bool), PathBuf)> = Default::default();
-    for root in ["C:\\Program Files\\Image-Line", "C:\\Program Files (x86)\\Image-Line"] {
-        let Ok(dirs) = std::fs::read_dir(root) else { continue };
+    let mut roots = Vec::new();
+    for letter in b'C'..=b'Z' {
+        let d = letter as char;
+        if !Path::new(&format!("{d}:\\")).exists() {
+            continue;
+        }
+        roots.push(format!("{d}:\\Program Files\\Image-Line"));
+        roots.push(format!("{d}:\\Program Files (x86)\\Image-Line"));
+    }
+    for root in roots {
+        let Ok(dirs) = std::fs::read_dir(&root) else { continue };
         for d in dirs.flatten() {
             let dname = d.file_name().to_string_lossy().to_string();
             if !dname.to_lowercase().starts_with("fl studio") {
@@ -399,6 +418,57 @@ fn quoted(p: &Path) -> String {
     format!("\"{}\"", p.display())
 }
 
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// A hidden task for the signed-in user, every `minutes` minutes, on battery too, one at a time
+/// (schtasks /SC MINUTE would make one that waits for AC power and stops when it goes away).
+fn create_task(name: &str, exe: &Path, args: &str, minutes: u32) -> std::result::Result<(), String> {
+    let user = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default());
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
+         <RegistrationInfo><Description>FL Library: {desc}</Description></RegistrationInfo>\r\n\
+         <Triggers><TimeTrigger><Repetition><Interval>PT{minutes}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>\
+         <StartBoundary>2024-01-01T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\r\n\
+         <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n\
+         <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\
+         <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable>\
+         <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\
+         <AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>true</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle>\
+         <WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT4H</ExecutionTimeLimit><Priority>7</Priority></Settings>\r\n\
+         <Actions Context=\"Author\"><Exec><Command>{exe}</Command><Arguments>{args}</Arguments></Exec></Actions>\r\n\
+         </Task>\r\n",
+        desc = xml_escape(name),
+        user = xml_escape(&user),
+        exe = xml_escape(&exe.to_string_lossy()),
+        args = xml_escape(args.trim()),
+    );
+    let file = std::env::temp_dir().join(format!("fl-library-task-{}.xml", fnv(name.as_bytes())));
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+    for u in xml.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+    let out = hidden(Command::new("schtasks").args(["/Create", "/F", "/TN", name, "/XML", &file.to_string_lossy()]))
+        .output()
+        .map_err(|e| format!("schtasks: {e}"))?;
+    let _ = std::fs::remove_file(&file);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        log(&format!("task {name} via XML failed ({err}); plain schtasks instead"));
+        let tr = format!("{} {}", quoted(exe), args.trim());
+        let out = hidden(Command::new("schtasks").args(["/Create", "/F", "/TN", name, "/SC", "MINUTE", "/MO", &minutes.to_string(), "/TR", &tr]))
+            .output()
+            .map_err(|e| format!("schtasks: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Start a program as the signed-in user rather than elevated (Explorer launches it for us).
 fn start_unelevated(exe: &Path) {
     let _ = Command::new("explorer.exe").arg(exe).spawn();
@@ -556,16 +626,10 @@ fn install(opts: [bool; 3], p: &Progress) -> std::result::Result<(), String> {
 
     // 4. background re-index every 30 minutes
     p.send(0.82, "Scheduling re-indexing", "Every 30 minutes, only new or changed projects");
-    let tr = format!("{} {}", quoted(&pythonw), quoted(&app.join("scanner.py")));
-    let out = hidden(Command::new("schtasks").args(["/Create", "/F", "/TN", TASK, "/SC", "MINUTE", "/MO", "30", "/TR", &tr]))
-        .output()
-        .map_err(|e| format!("schtasks: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("could not create the scan task: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
+    create_task(TASK, &pythonw, &format!("{} ", quoted(&app.join("scanner.py"))), 30)
+        .map_err(|e| format!("could not create the scan task: {e}"))?;
     // tags / bookmarks shared with other PCs through config.json "sync_dir": pull every 5 minutes
-    let sync = format!("{} {} sync", quoted(&pythonw), quoted(&app.join("flctl.py")));
-    let _ = hidden(Command::new("schtasks").args(["/Create", "/F", "/TN", TASK_SYNC, "/SC", "MINUTE", "/MO", "5", "/TR", &sync])).output();
+    let _ = create_task(TASK_SYNC, &pythonw, &format!("{} sync", quoted(&app.join("flctl.py"))), 5);
 
     // 5. Apps & features entry, startup, launch
     p.send(0.9, "Almost there", "Adding FL Library to Apps & features");
@@ -624,6 +688,7 @@ fn uninstall(delete_library: bool, p: &Progress) -> std::result::Result<(), Stri
         reg_delete_value(hklm, KEY_ASSOC, name);
     }
     reg_delete_value(hklm, KEY_RUN, "FLLibraryPanel");
+    reg_delete_tree(HKEY_CURRENT_USER, KEY_APP); // the panel's on/off and hide-demos switches
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
@@ -1098,7 +1163,7 @@ fn main() -> Result<()> {
     if silent {
         // unattended run (testing / deployment): no window, result in the log and the exit code
         let p = Progress(0);
-        let r = if uninstalling { uninstall(false, &p) } else { install([true, true, false], &p) };
+        let r = if uninstalling { uninstall(false, &p) } else { install([startup_wanted(), true, false], &p) };
         log(&format!("silent result: {r:?}"));
         if std::env::args().any(|a| a.eq_ignore_ascii_case("/notify")) {
             // started by the panel's own "update" action: say how it went
@@ -1145,7 +1210,7 @@ fn main() -> Result<()> {
             uninstall: uninstalling,
             dpi,
             tick: 0,
-            options: if uninstalling { [false, false, false] } else { [true, true, true] },
+            options: if uninstalling { [false, false, false] } else { [startup_wanted(), true, !installed()] },
             everything: None,
             fl_versions: if uninstalling { Vec::new() } else { find_fl().into_iter().map(|(m, _)| m).collect() },
             progress: 0.0,

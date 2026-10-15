@@ -27,6 +27,16 @@ def song_for(db, path):
     return row[0]
 
 
+def exists_fast(path):
+    """os.path.exists, except that a file on a PC that is off is 'not here' in under a second
+    instead of after a 20-second network timeout."""
+    if path.startswith('\\\\'):
+        parts = path.split('\\')
+        if len(parts) > 2 and not host_alive(parts[2]):
+            return False
+    return os.path.exists(path)
+
+
 def db_path(db, path):
     """The library row that stands for this file: itself for an .flp, the project inside for an
     FL project zip (rows are keyed "zip|member")."""
@@ -40,14 +50,16 @@ def db_path(db, path):
 
 def parse_any(path):
     """Parse an .flp, or the project inside an FL zip ("zip|member", or the zip's first .flp)."""
-    import zipfile
     zpath, _sep, member = path.partition('|')
     if not zpath.lower().endswith('.zip'):
         return scanner.flparse.parse_file(path)
-    with zipfile.ZipFile(zpath) as z:
+    with scanner.open_zip(zpath) as z:
         if not member:
-            member = next(n for n in z.namelist() if n.lower().endswith('.flp'))
-        return scanner.flparse.parse_buffer(z.read(member))
+            members = scanner.zip_flp_members(z, zpath)
+            if not members:
+                raise ValueError('no FL project inside this zip')
+            member = members[0]
+        return scanner.flparse.parse_buffer(z.read(scanner.zip_real_name(z, member, zpath)))
 
 
 def ask(title, prompt, initial):
@@ -198,20 +210,86 @@ pe_machine = scanner.pe_machine
 # folder names that are just "a plugins folder", not a plugin's own folder
 GENERIC_PLUGIN_DIRS = {'vstplugins', 'vstplugins64', 'vst plugins', 'vst', 'vst2', 'vst3', 'plugins', 'steinberg',
                        'common files', 'program files', 'program files (x86)', 'x64', 'x86', '64', '32', '64-bit',
-                       '32-bit', 'win64', 'win32', 'windows', 'vsts', 'bu', 'backup'}
+                       '32-bit', 'win64', 'win32', 'windows', 'vsts', 'bu', 'backup', 'downloads', 'desktop',
+                       'documents', 'temp', 'tmp', 'new folder', 'old', 'audio', 'music', 'software', 'programs',
+                       'installers', 'install', 'setup', 'setups', 'users', 'public', ''}
+
+
+_PIPE_GONE = False
+
+
+def emit_json(ev):
+    """One JSON line to the panel. When the window was closed mid-copy the pipe is gone: the copy
+    goes on, quietly."""
+    global _PIPE_GONE
+    if _PIPE_GONE:
+        return
+    try:
+        sys.stdout.write(json.dumps(ev) + '\n')
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        _PIPE_GONE = True
+
+
+_EV_DOWN = set()
 
 
 def everything_hits(url, search, limit=50):
-    """Full paths from an Everything HTTP server (ours or another PC's)."""
+    """Full paths from an Everything HTTP server (ours or another PC's). An Everything that does
+    not answer is remembered for the run (one slow timeout, not one per file)."""
     import urllib.parse
     import urllib.request
+    if url in _EV_DOWN or not everything_alive(url):
+        return []
     qs = urllib.parse.urlencode({'json': 1, 'path_column': 1, 'size_column': 1, 'count': limit, 'search': search})
     try:
         with urllib.request.urlopen(url.rstrip('/') + '/?' + qs, timeout=6) as r:
             data = json.load(r)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        trace(f'everything {url}: {e}')
+        _EV_DOWN.add(url)
         return []
     return [(x['path'] + '\\' + x['name'], int(x.get('size') or 0)) for x in data.get('results', []) if x.get('path')]
+
+
+_EV_ALIVE = {}
+_PROBE_LOCK = None
+
+
+def everything_alive(url, timeout=1.5):
+    """Is this Everything HTTP server answering? One TCP probe per run per server."""
+    import socket
+    import threading
+    import urllib.parse
+    global _PROBE_LOCK
+    _PROBE_LOCK = _PROBE_LOCK or threading.Lock()
+    with _PROBE_LOCK:
+        if url not in _EV_ALIVE:
+            u = urllib.parse.urlsplit(url)
+            try:
+                socket.create_connection((u.hostname or '127.0.0.1', u.port or 80), timeout=timeout).close()
+                _EV_ALIVE[url] = True
+            except OSError:
+                _EV_ALIVE[url] = False
+                _EV_DOWN.add(url)
+        return _EV_ALIVE[url]
+
+
+def peers_report(cfg):
+    """Which of the other PCs answered, for the summary line: ('', or ' (x, y not reachable)')."""
+    dead = [p['everything'] for p in cfg.get('peers') or [] if not everything_alive(p['everything'])]
+    return f" (not reachable: {', '.join(dead)})" if dead else ''
+
+
+NET_ERRORS = (51, 53, 58, 59, 64, 67, 121, 1203, 1231)  # Windows: the server or path is unreachable
+
+
+def is_net_error(e):
+    """An OSError that means 'the other PC / share is not there', not 'that file is not there'."""
+    w = getattr(e, 'winerror', None)
+    if w is not None:
+        return w in NET_ERRORS
+    return isinstance(e, OSError) and e.errno in (53, 64, 67, 1231)
 
 
 def project_plugins(db, flp):
@@ -231,7 +309,12 @@ def project_plugins(db, flp):
             plugins = json.loads(row[0]) if row and row[0] else []
         except Exception:
             plugins = parse_any(key)['plugins']
-    return [p for p in plugins if p.get('path')]
+    out, seen = [], set()
+    for p in plugins:
+        if p.get('path') and (p['name'].lower(), p['path'].lower()) not in seen:
+            seen.add((p['name'].lower(), p['path'].lower()))
+            out.append(p)
+    return out
 
 
 def missing_plugins(db, flp, cfg):
@@ -279,7 +362,7 @@ def is_64bit(path):
     header.) 32-bit ones go through FL's bridge, which is what fails on a PC without the rest of
     the plugin's install."""
     low = path.lower()
-    if '%' in low or low.endswith('.vst3') or '.vst3\\' in low:
+    if '%' in low or low.endswith('.vst3') or ('.vst3\\' in low and '\\x86-win\\' not in low):
         return True
     if low not in _MACHINE:
         _MACHINE[low] = scanner.pe_machine(path)
@@ -295,7 +378,10 @@ def plugin_sources(cfg, name, path, local_copies=()):
     here = cfg['everything_url']
     stem = scanner.plugin_stem(base)
     search = f'file: <wfn:"{base}"|wfn:"{stem}">' if stem != base.lower() else f'file: wfn:"{base}"'
+    wanted = scanner.make_filter(cfg)
     for full, size in everything_hits(here, search, 200):
+        if not wanted(full):
+            continue  # a share that mirrors a local drive: the same file twice
         if full.startswith('\\\\'):
             cands.append((full, size, 'network share'))
         elif not local_copies:
@@ -356,18 +442,59 @@ def bits_label(path):
 
 
 _HOSTS = {}
+_HOST_LOCK = None
 
 
 def host_alive(host, timeout=0.8):
     """Is this file server answering? Cached per run; a dead host would stall every file open."""
     import socket
-    if host not in _HOSTS:
-        try:
-            socket.create_connection((host, 445), timeout=timeout).close()
-            _HOSTS[host] = True
-        except OSError:
-            _HOSTS[host] = False
-    return _HOSTS[host]
+    import threading
+    global _HOST_LOCK
+    _HOST_LOCK = _HOST_LOCK or threading.Lock()
+    key = host.lower()
+    with _HOST_LOCK:
+        if not _HOSTS:
+            _HOSTS.update(_dead_hosts_recent())
+        if key not in _HOSTS:
+            try:
+                socket.create_connection((host, 445), timeout=timeout).close()
+                _HOSTS[key] = True
+            except OSError:
+                _HOSTS[key] = False
+                _remember_dead(key)
+        return _HOSTS[key]
+
+
+_DEAD_FILE = os.path.join(scanner.DATA_DIR, 'hosts-off.json')
+
+
+def _dead_hosts_recent():
+    try:
+        d = json.load(open(_DEAD_FILE, encoding='utf-8'))
+        now = time.time()
+        return {h: False for h, t in d.items() if now - t < 120}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember_dead(host):
+    try:
+        d = {h: time.time() for h in _dead_hosts_recent()}
+        d[host] = time.time()
+        with open(_DEAD_FILE, 'w', encoding='utf-8') as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
+def bits_of(path):
+    """'64-bit' / '32-bit' / '' for a plugin file, reading its header once per run."""
+    low = path.lower()
+    if low.endswith('.vst3'):
+        return '64-bit'
+    if low not in _MACHINE:
+        _MACHINE[low] = scanner.pe_machine(path)
+    return bits_label(path)
 
 
 def installer_candidates(cfg, name):
@@ -416,17 +543,6 @@ def plugin_dest(cfg, src, stored_path):
 SUPPORT_LIMIT = 1 << 30  # 1 GB: beyond this the folder is a sound library, not "support files"
 
 
-def tree_size(path):
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                pass
-    return total
-
-
 def copy_plugin(src, dest, progress=None):
     """Copy the plugin to its new home, plus the support files that live next to it. progress(done,
     total) is called as bytes land. Returns a note when support files were skipped for size."""
@@ -443,9 +559,15 @@ def copy_plugin(src, dest, progress=None):
         files.append((src, dest))
         sdir, ddir = os.path.dirname(src), os.path.dirname(dest)
         stem = os.path.splitext(os.path.basename(src))[0].lower()
-        folder_is_generic = os.path.basename(sdir).lower() in GENERIC_PLUGIN_DIRS
+        folder = os.path.basename(sdir).lower()
+        entries = os.listdir(sdir)
+        # the plugin's own folder: named after it, or a small folder that is not a generic one
+        # (a drive root, Downloads or a 300-file VstPlugins folder is never "support files")
+        own_folder = (folder not in GENERIC_PLUGIN_DIRS and sdir != os.path.dirname(sdir)
+                      and (stem.split('_')[0][:6] in folder or len(entries) <= 40))
+        folder_is_generic = not own_folder
         extras, shortcuts = [], []
-        for entry in os.listdir(sdir):
+        for entry in entries:
             s = os.path.join(sdir, entry)
             if os.path.normcase(s) == os.path.normcase(src):
                 continue
@@ -457,12 +579,19 @@ def copy_plugin(src, dest, progress=None):
             if same_stem or not folder_is_generic:  # a plugin in its own folder: bring the folder
                 extras.append((s, os.path.join(ddir, entry)))
         files += [(s, d) for s, d in extras if os.path.isfile(s)]
+        walked = 0
         for s, d in extras:
             if os.path.isdir(s):
                 for root, _dirs, names in os.walk(s):
                     for n in names:
                         sf = os.path.join(root, n)
                         files.append((sf, os.path.join(d, os.path.relpath(sf, s))))
+                        try:
+                            walked += os.path.getsize(sf)
+                        except OSError:
+                            pass
+                    if walked > SUPPORT_LIMIT:  # a sound library: no point sizing the rest
+                        break
     sizes = []
     for s, _d in files:
         try:
@@ -544,8 +673,12 @@ def copy_batch(cfg, db, batch, emit):
                 trace(f'copy {name}: done {note}')
                 note_plugin_file(name, dest)
                 lic = licensed_note(src)
-                emit(plugin=name, status='licensed' if lic else 'ok', detail=f'{dest}   (from {src})' + (f'   {note}' if note else ''))
-                report.append(f'OK  {name}\n      -> {dest}\n      from {src}'
+                bits = bits_of(src) if src.lower().endswith('.dll') else ''
+                if bits == '32-bit':
+                    bits = '32-bit: FL 64 Bit has to bridge it'
+                emit(plugin=name, status='licensed' if lic else 'ok',
+                     detail=f'{dest}   (from {src})' + (f'   ({bits})' if bits else '') + (f'   {note}' if note else ''))
+                report.append(f'OK  {name}\n      -> {dest}\n      from {src}' + (f'   ({bits})' if bits else '')
                               + ('\n      (licensed plugin: a copied file may not run, use its installer)' if lic else '')
                               + (f'\n      {note}' if note else ''))
                 ok += 1
@@ -556,7 +689,7 @@ def copy_batch(cfg, db, batch, emit):
                 errors.append((src, e))
         if not done:
             unc = [(s, e) for s, e in errors if s.startswith('\\\\')]
-            offline = sorted(set(offline_hosts) | {s.split('\\')[2] for s, e in unc if e.errno in (2, 53, 64, 67, 1231)})
+            offline = sorted(set(offline_hosts) | {s.split('\\')[2] for s, e in unc if is_net_error(e)})
             if not errors and offline:
                 emit(plugin=name, status='offline', detail=f"copies exist on {', '.join(offline)} but it is offline right now")
                 report.append(f"XX  {name}: copies exist on {', '.join(offline)} but it is offline right now")
@@ -581,8 +714,7 @@ def fetch_plugins(flp, json_out=False, search_only=False):
 
     def emit(**ev):
         if json_out:
-            sys.stdout.write(json.dumps(ev) + '\n')
-            sys.stdout.flush()
+            emit_json(ev)
 
     def say(text, flags=0x40):
         if not json_out:
@@ -607,6 +739,14 @@ def fetch_plugins(flp, json_out=False, search_only=False):
         db.close()
         return
     emit(plugins=[name for name, _p, _l, _o in missing])
+    if not everything_alive(cfg['everything_url']):
+        for name, _p, _l, _o in missing:
+            emit(plugin=name, status='error', detail='Everything is not answering: nothing was searched')
+        text = f"Everything is not answering at {cfg['everything_url']}: nothing was searched. Start Everything (Tools > Options > HTTP Server on) and try again."
+        emit(searched=True, found=0, total=len(missing), summary=text)
+        say(text, 0x30)
+        db.close()
+        return
     from concurrent.futures import ThreadPoolExecutor, as_completed
     only32 = {name for name, _p, _l, o in missing if o}
     for name, path, _l, o in missing:
@@ -658,7 +798,7 @@ def fetch_plugins(flp, json_out=False, search_only=False):
     if search_only:  # the fetch window: the user picks what to copy, then fetchplugins-many
         db.close()
         n, k = len(missing), len(plan)
-        text = f'{k} of {n} plugin(s) found.'
+        text = f'{k} of {n} plugin(s) found{peers_report(cfg)}.'
         text += (' Untick what you do not want, right-click a row to change its source, then Copy selected.' if k
                  else ' Nothing to copy: no copy of them on any drive or PC that is on.')
         emit(searched=True, found=k, total=n, summary=text)
@@ -715,7 +855,7 @@ def copy_plan(cfg, db, plan, emit):
         emit(plugin=name, status='admin', detail='copying into Program Files needs admin permission')
     fd, plan_file = tempfile.mkstemp(prefix='fl-library-fetch-', suffix='.json')
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(plan, f)
+        json.dump({'plan': plan, 'cfg': cfg, 'data_dir': scanner.DATA_DIR}, f)
     out_file = plan_file + '.out'
     params = f'"{os.path.abspath(__file__)}" fetchplugins-copy "{plan_file}"'
     trace(f'copy_plan: elevating: {sys.executable} {params}')
@@ -763,8 +903,7 @@ def fetch_many(flp, plan_file, json_out=True):
     plan_file: JSON [{"name": .., "src": ..}, ..]."""
     def emit(**ev):
         if json_out:
-            sys.stdout.write(json.dumps(ev) + '\n')
-            sys.stdout.flush()
+            emit_json(ev)
 
     wanted = json.load(open(plan_file, encoding='utf-8'))
     try:
@@ -810,8 +949,7 @@ def fetch_one(flp, name, src, json_out=True):
     """Copy one plugin of the project from the source the user picked (fetch window, right-click)."""
     def emit(**ev):
         if json_out:
-            sys.stdout.write(json.dumps(ev) + '\n')
-            sys.stdout.flush()
+            emit_json(ev)
 
     trace(f'fetch_one: {name} from {src}')
     cfg = scanner.load_config()
@@ -822,7 +960,7 @@ def fetch_one(flp, name, src, json_out=True):
         emit(plugin=name, status='error', detail='plugin not found in the project')
         db.close()
         return
-    if not os.path.exists(src):
+    if not exists_fast(src):
         trace('fetch_one: source not reachable')
         emit(plugin=name, status='offline' if src.startswith('\\\\') else 'error',
              detail=f'{src} is not reachable right now')
@@ -836,13 +974,17 @@ def fetch_one(flp, name, src, json_out=True):
 
 def fetch_copy_elevated(plan_file):
     """The elevated half of fetch_plugins: copy everything in the plan, report to <plan>.out."""
-    plan = json.load(open(plan_file, encoding='utf-8'))
+    job = json.load(open(plan_file, encoding='utf-8'))
+    plan, cfg = (job['plan'], job.get('cfg')) if isinstance(job, dict) else (job, None)
+    if isinstance(job, dict) and job.get('data_dir'):
+        scanner.DATA_DIR = job['data_dir']  # the user's library, not the admin account's
+        scanner.DB_PATH = os.path.join(scanner.DATA_DIR, 'library.db')
     with open(plan_file + '.out', 'w', encoding='utf-8') as out:
         def emit(**ev):
             out.write(json.dumps(ev) + '\n')
             out.flush()
         try:
-            cfg = scanner.load_config()
+            cfg = cfg or scanner.load_config()
             _ok, lines = copy_batch(cfg, None, [(n, p, [tuple(s) for s in srcs]) for n, p, srcs in plan], emit)
             for line in lines:
                 emit(report=line)
@@ -1078,11 +1220,17 @@ def project_samples(db, flp):
         if not sp or st in ('ok', 'inzip', 'factory'):
             continue
         name = os.path.basename(sp)
-        if st == 'unchecked' and (os.path.exists(scanner.expand_sample(sp)) or os.path.exists(os.path.join(here, name))):
-            continue
+        low = sp.lower()
+        if st == 'unchecked':
+            if low.startswith(('%flstudiofactorydata%', '%flstudiodata%', '\\patches\\', 'patches\\')) or scanner.FACTORY_SAMPLE_RE.search(low):
+                continue  # FL's own content
+            full = sp if os.path.isabs(sp) else os.path.join(here, sp)
+            if exists_fast(scanner.expand_sample(full)) or os.path.exists(os.path.join(here, name)):
+                continue
         if os.path.exists(os.path.join(here, name)):
             continue  # already fetched next to the project
-        out.append((sp, st or 'missing', it.get('found')))
+        found = it.get('found')
+        out.append((sp, st or 'missing', found if found and exists_fast(found) else None))
     return out
 
 
@@ -1118,10 +1266,11 @@ def zip_members(zpath):
     if zpath not in _ZIP_NAMES:
         names = {}
         try:
-            with zipfile.ZipFile(zpath) as z:
+            with scanner.open_zip(zpath) as z:
                 for n in z.namelist():
                     if not n.endswith('/'):
-                        names.setdefault(n.replace('\\', '/').rsplit('/', 1)[-1].lower(), n)
+                        shown = scanner.zip_member_name(n, zpath)
+                        names.setdefault(shown.replace('\\', '/').rsplit('/', 1)[-1].lower(), n)
         except (OSError, zipfile.BadZipFile):
             pass
         _ZIP_NAMES[zpath] = names
@@ -1143,8 +1292,10 @@ def sample_sources(cfg, flp, zips, stored, found):
     cands = []
     if found:
         cands.append((found, 'this PC', 5))
+    wanted_f = scanner.make_filter(cfg)
     for full, _size in everything_hits(cfg['everything_url'], f'file: wfn:"{name}"', 300):
-        cands.append((full, 'network share' if full.startswith('\\\\') else 'this PC', 0))
+        if wanted_f(full):
+            cands.append((full, 'network share' if full.startswith('\\\\') else 'this PC', 0))
     for peer in cfg.get('peers') or []:
         for full, _size in everything_hits(peer['everything'], f'file: wfn:"{name}"', 200):
             if full[1:3] == ':\\' and peer.get('share'):
@@ -1171,6 +1322,21 @@ def sample_sources(cfg, flp, zips, stored, found):
     return [(src, where) for _s, src, where in scored] + offline
 
 
+def sample_labels(paths):
+    """Row names for the fetch window: the file name, or folder\\name when two samples share a name
+    (they are then copied into that sub-folder next to the project; FL searches there too)."""
+    names = [os.path.basename(p) for p in paths]
+    dup = {n.lower() for n in names if sum(1 for m in names if m.lower() == n.lower()) > 1}
+    out = []
+    for p, n in zip(paths, names):
+        if n.lower() in dup:
+            folder = os.path.basename(os.path.dirname(p)) or 'samples'
+            out.append(folder + '\\' + n)
+        else:
+            out.append(n)
+    return out
+
+
 def source_label(src):
     if src.startswith('zip|'):
         _z, zpath, member = src.split('|', 2)
@@ -1184,7 +1350,7 @@ def copy_sample(src, dest):
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     if src.startswith('zip|'):
         _z, zpath, member = src.split('|', 2)
-        with zipfile.ZipFile(zpath) as z, z.open(member) as m, open(dest, 'wb') as out:
+        with scanner.open_zip(zpath) as z, z.open(scanner.zip_real_name(z, member, zpath)) as m, open(dest, 'wb') as out:
             shutil.copyfileobj(m, out, 1 << 20)
     else:
         shutil.copy2(src, dest)
@@ -1195,8 +1361,7 @@ def fetch_samples(flp, json_out=False, search_only=False):
     drive and PC) and copy them next to the .flp, where FL looks for them."""
     def emit(**ev):
         if json_out:
-            sys.stdout.write(json.dumps(ev) + '\n')
-            sys.stdout.flush()
+            emit_json(ev)
 
     flp = os.path.abspath(flp)
     trace(f'samples: {flp}')
@@ -1215,8 +1380,17 @@ def fetch_samples(flp, json_out=False, search_only=False):
             ctypes.windll.user32.MessageBoxW(None, 'All samples of this project are where FL will find them.', 'FL Library', 0x40)
         db.close()
         return
-    names = [os.path.basename(sp) for sp, _st, _f in wanted]
+    names = sample_labels([sp for sp, _st, _f in wanted])
     emit(plugins=names)
+    if not everything_alive(cfg['everything_url']):
+        for n in names:
+            emit(plugin=n, status='error', detail='Everything is not answering: nothing was searched')
+        text = f"Everything is not answering at {cfg['everything_url']}: nothing was searched. Start Everything (Tools > Options > HTTP Server on) and try again."
+        emit(searched=True, found=0, total=len(wanted), summary=text)
+        if not json_out:
+            ctypes.windll.user32.MessageBoxW(None, text, 'FL Library - fetch samples', 0x30)
+        db.close()
+        return
     zips = song_zips(db, flp)
     trace(f'samples: {len(wanted)} wanted, {len(zips)} zips')
     for n in names:
@@ -1224,7 +1398,7 @@ def fetch_samples(flp, json_out=False, search_only=False):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     found_n = 0
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(sample_sources, cfg, flp, zips, sp, f): (os.path.basename(sp), sp) for sp, _st, f in wanted}
+        futures = {pool.submit(sample_sources, cfg, flp, zips, sp, f): (n, sp) for n, (sp, _st, f) in zip(names, wanted)}
         for fut in as_completed(futures):
             n, sp = futures[fut]
             try:
@@ -1244,7 +1418,7 @@ def fetch_samples(flp, json_out=False, search_only=False):
                 emit(plugin=n, status='notfound', detail=f'no copy on any drive or PC   (was {sp})')
     db.close()
     trace('samples: search done')
-    text = f'{found_n} of {len(wanted)} missing sample(s) found.'
+    text = f'{found_n} of {len(wanted)} missing sample(s) found{peers_report(cfg)}.'
     text += (' Untick what you do not want, right-click a row to change its source, then Copy selected.' if found_n
              else ' Nothing to copy.')
     if search_only or json_out:
@@ -1257,8 +1431,7 @@ def fetch_samples_many(flp, plan_file, json_out=True):
     """Copy the ticked samples next to the .flp, each from the chosen source."""
     def emit(**ev):
         if json_out:
-            sys.stdout.write(json.dumps(ev) + '\n')
-            sys.stdout.flush()
+            emit_json(ev)
 
     wanted = json.load(open(plan_file, encoding='utf-8'))
     try:
@@ -1279,7 +1452,7 @@ def fetch_samples_many(flp, plan_file, json_out=True):
             emit(plugin=name, status='ok', detail=f'{dest}   (from {source_label(src)})')
         except Exception as e:  # noqa: BLE001 - zip, network or disk, all reported the same way
             trace(f'samples_many: {name} failed {e}')
-            emit(plugin=name, status='offline' if src.startswith('\\\\') and isinstance(e, OSError) and e.errno in (2, 53, 64, 67, 1231) else 'error',
+            emit(plugin=name, status='offline' if src.startswith('\\\\') and is_net_error(e) else 'error',
                  detail=f'could not copy from {source_label(src)}: {e}')
     text = f'{ok} of {len(wanted)} copied next to the project.'
     if ok:
@@ -1354,4 +1527,9 @@ if __name__ == '__main__':
     try:
         main(sys.argv[1:])
     except Exception as e:  # noqa: BLE001 - no console under pythonw, so show it
-        ctypes.windll.user32.MessageBoxW(None, f'{type(e).__name__}: {e}', 'FL Library', 0x10)
+        if '--json' in sys.argv:  # the panel's fetch window is reading: tell it
+            import traceback
+            trace('crash: ' + traceback.format_exc())
+            emit_json({'summary': f'{type(e).__name__}: {e}', 'searched': True, 'found': 0, 'total': 0})
+        else:
+            ctypes.windll.user32.MessageBoxW(None, f'{type(e).__name__}: {e}', 'FL Library', 0x10)

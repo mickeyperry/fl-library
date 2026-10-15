@@ -48,8 +48,8 @@ list. It never moves or changes your project files.
   - **Colours:** each project folder gets its own colour.
 - **Explorer columns for `.flp` files:** FL version, BPM, status, rating, hours worked, missing
   samples and versions. Right-click a column header → More…
-- **Right-click menu** on `.flp` files: set status, rating, tags and notes, list samples, find all
-  copies.
+- **Right-click menu** on `.flp` files: set status, rating, bookmark, find all copies, rescan the
+  library (tags and notes are edited in the panel). On Windows 11 it sits under "Show more options".
 - **Tray icon:** click to turn the panel on or off; right-click → Check for updates / Exit. The
   panel also checks GitHub once a day and offers a newer release when there is one; the update
   installs itself and restarts the panel.
@@ -76,7 +76,8 @@ following:
 - starts the panel and, if you choose, adds it to Windows startup
 - adds a scheduled task that re-indexes every 30 minutes (only new or changed files are parsed)
 
-Your library (index, tags, notes, bookmarks) lives in `%LOCALAPPDATA%\FL Library`.
+Your library (index, tags, notes, bookmarks) and `config.json` live in `%LOCALAPPDATA%\FL Library`
+(the config file is created with defaults by the first scan; edit it there).
 
 To uninstall, use Windows **Settings → Apps → FL Library**. Removing your library as well is
 optional.
@@ -111,7 +112,10 @@ powershell -ExecutionPolicy Bypass -File install.ps1     # uninstall.ps1 to remo
 | `everything_url` | Everything's HTTP server address |
 | `exclude_prefixes` | path roots to skip, e.g. network shares that mirror local drives |
 | `exclude_contains` | skip any path containing these |
-| `pythonw` | which `pythonw.exe` to use; defaults to the first one on PATH |
+| `pythonw` | (source checkout only) which `pythonw.exe` to use; defaults to the first one on PATH |
+| `fl_exe` | the FL Studio exe projects open with; default: the newest installed |
+| `fl_user_data` | FL's user data folder when it is not `Documents\Image-Line` (Options > File settings) |
+| `zip_encoding` | how FL project zips name their files: `auto` (this PC's code pages and the languages of its keyboards), or a code page such as `cp862` (Hebrew), `cp866` (Russian). FL writes those names in the DOS code page of the PC that saved the zip. |
 | `port` | port of the optional browser UI (`python server.py`) |
 | `peers` | other PCs to fetch missing plugins from: `[{"everything": "http://<ip>:8666/", "share": "\\\\<ip>\\{drive}"}]`. Each needs Everything's HTTP server reachable over the network (allow it through its firewall) and a share that maps its drive letters (`{drive}` is replaced by the letter). Network shares that this PC's Everything already indexes are searched without any setup. |
 | `vst_dir`, `vst_dir_x86`, `vst3_dir` | where fetched plugins are copied (64-bit VST2, 32-bit VST2, VST3). Default: FL's usual folders under Program Files. Folders where FL has already found plugins (its plugin database) count as VST folders automatically; `vst_extra_dirs` adds more. |
@@ -155,4 +159,7 @@ anyone on that network list your file names, so only do it on a network you trus
   sample, not factory content: a fresh FL has none of it. Fetch samples looks for those too.
 - Shared data (`sync_dir`) resolves conflicts by newest change, so keep the PCs' clocks in sync.
 - The panel's project data refreshes with each scan (every 30 minutes, or right-click a project →
-  FL Library → **Rescan library now**).
+  FL Library → **Rescan library now**); the panel redraws itself when a scan finishes.
+- A project that fails to read (a share that dropped, FL saving it at that moment) keeps its last
+  good data and is read again next scan. Files that are not FL projects at all (VMware ships
+  floppy images named `.flp`) are skipped.

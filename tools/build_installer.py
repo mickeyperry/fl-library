@@ -87,12 +87,35 @@ def main():
     out = os.path.join(ROOT, 'dist', 'FL-Library-Setup.exe')
     shutil.copy(os.path.join(ROOT, 'installer', 'target', 'release', 'FL-Library-Setup.exe'), out)
     print('built', out, f'({os.path.getsize(out) / 1e6:.1f} MB)')
-    # refuse to hand out a binary that still names the builder
-    user = os.path.basename(os.path.expanduser('~')).lower().encode()
-    data = open(out, 'rb').read().lower()
-    if user and (user in data or user.decode().encode('utf-16-le') in data):
-        sys.exit(f'!! {out} still contains the user name "{user.decode()}": do not publish it')
-    print('privacy check: no user name inside')
+    privacy_check(out, payload.getvalue())
+
+
+def privacy_check(exe, payload_zip):
+    """Refuse to hand out a binary that names the builder's account, PC or local network: the
+    payload is compressed inside the exe, so every member is checked on its own."""
+    import re
+    import zipfile
+    needles = {os.path.basename(os.path.expanduser('~')).lower(), os.environ.get('COMPUTERNAME', '').lower()} - {''}
+    needles = {n for n in needles if len(n) >= 4}
+    allowed = re.compile(rb'github\.com/(?:repos/)?[a-z0-9_-]+/fl-library|mickeyperry\.github\.io', re.I)  # the project's own address
+    lan = re.compile(rb'(?<![\d.])(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}')
+
+    def check(name, data):
+        low = allowed.sub(b'', data.lower())
+        for n in needles:
+            if n.encode() in low or n.encode('utf-16-le') in low:
+                sys.exit(f'!! {name} contains "{n}": do not publish it')
+        m = lan.search(low)
+        if m and not name.endswith(('.pyc', '.dll', '.pyd', '.zip')):
+            sys.exit(f'!! {name} contains a LAN address {m.group().decode()}: do not publish it')
+
+    check(exe, open(exe, 'rb').read())
+    with zipfile.ZipFile(io.BytesIO(payload_zip)) as z:
+        for info in z.infolist():
+            if info.filename.startswith('python/'):
+                continue  # the official python.org embeddable build
+            check(info.filename, z.read(info))
+    print('privacy check: no user name, PC name or LAN address inside')
 
 
 if __name__ == '__main__':

@@ -200,9 +200,25 @@ pub(crate) fn reg_str(name: PCWSTR) -> Option<String> {
     }
 }
 
+/// Where library.db is: the installer's registry value, unless that points into another user's
+/// profile (the install ran under an admin account) and this user has a library of their own.
+pub fn db_file() -> Option<String> {
+    let reg = reg_str(w!("Db"))?;
+    let local = std::env::var("LOCALAPPDATA").ok().map(|l| format!("{l}\\FL Library\\library.db"));
+    if let Some(local) = local {
+        let profile = std::env::var("USERPROFILE").unwrap_or_default().to_lowercase();
+        let mine = !profile.is_empty() && reg.to_lowercase().starts_with(&profile);
+        let reg_exists = std::path::Path::new(&reg).exists();
+        if (!mine || !reg_exists) && std::path::Path::new(&local).exists() && reg.to_lowercase().contains("\\users\\") {
+            return Some(local);
+        }
+    }
+    Some(reg)
+}
+
 fn db_path() -> Option<&'static CString> {
     static PATH: OnceLock<Option<CString>> = OnceLock::new();
-    PATH.get_or_init(|| CString::new(reg_str(w!("Db"))?).ok()).as_ref()
+    PATH.get_or_init(|| CString::new(db_file()?).ok()).as_ref()
 }
 
 /// Run a one-parameter query; every column comes back as text.

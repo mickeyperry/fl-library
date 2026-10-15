@@ -1,4 +1,5 @@
 # Removes the FL Library Explorer integration. Run elevated. The library database is left alone.
+if (-not [Environment]::Is64BitProcess) { throw 'run this from 64-bit PowerShell (the registered handler is 64-bit)' }
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $clsid = '{7C0B4E7A-52F1-4B8E-9D7C-2F1A6B0C4D11}'
 $schema = Join-Path $root 'bin\flprops.propdesc'

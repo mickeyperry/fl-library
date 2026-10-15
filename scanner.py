@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 
 import flparse
 
@@ -48,6 +49,11 @@ DEFAULT_CONFIG = {
     'vst_dir_x86': None,  # 32-bit VST2 .dll
     'vst3_dir': None,     # .vst3
     'vst_extra_dirs': [],  # other folders FL is set to scan, if it misses them
+    # FL's user data folder when it is not Documents\Image-Line (Options > File settings)
+    'fl_user_data': None,
+    # how FL project zips name their files: "auto" (this PC's code pages + the languages of its
+    # keyboards), or a code page such as "cp862" (Hebrew), "cp866" (Russian), "cp437"
+    'zip_encoding': 'auto',
 }
 
 META_COLS = ('status', 'tags', 'rating', 'notes', 'bookmark', 'updated')
@@ -92,10 +98,16 @@ def sync_meta(db, cfg=None):
                                          row['notes'] or '', int(row['bookmark'] or 0), int(row['updated'] or 0)))
                 merged += 1
     db.commit()
-    tmp = mine + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump({k: v for k, v in local.items() if v.get('updated')}, f, ensure_ascii=False)
-    os.replace(tmp, mine)
+    tmp = f'{mine}.{os.getpid()}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({k: v for k, v in local.items() if v.get('updated')}, f, ensure_ascii=False)
+        os.replace(tmp, mine)
+    except OSError:  # the share went away mid-write, or another writer won: next time
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return merged
 
 AUDIO_EXTS = ('wav', 'mp3', 'ogg', 'flac', 'aif', 'aiff', 'wv', 'm4a')
@@ -123,7 +135,7 @@ CREATE TABLE IF NOT EXISTS plugin_files(file TEXT PRIMARY KEY, path TEXT, machin
 """
 
 AUTOSAVE_RE = re.compile(r'\s*\((autosaved|overwritten)[^)]*\)\s*$', re.I)
-VERSION_SUFFIX_RE = re.compile(r'([ _\-.]*(\(\d+\)|(v|ver|version)?[ _\-.]*\d+))+$', re.I)
+VERSION_SUFFIX_RE = re.compile(r'([ _\-.]*(\(\d+\)|(v|ver|version)[ _\-.]*\d+|(?<![\d])\d{1,3}))+$', re.I)
 GENERIC_DIRS = {'backup', 'flp', 'flps', 'projects', 'project', 'project data', 'fl studio', 'fl'}
 # FL's own content. Anchored on an "Image-Line" or "FL Studio <ver>" folder, so backup copies of the
 # program folder (…\program files\FL Studio 12\Data\…) count too; your own Data\Projects\<song> stay.
@@ -143,12 +155,47 @@ def reflag(db):
         if new != old:
             db.execute('UPDATE files SET is_factory = ? WHERE path = ?', (new, path))
     db.execute("UPDATE files SET is_factory = 1 WHERE hash IN "
-               "(SELECT hash FROM projects WHERE author LIKE 'FL%Studio%' OR author = 'Image-Line')")
+               "(SELECT hash FROM projects WHERE (author LIKE 'FL%Studio%' OR author = 'Image-Line') "
+               "AND IFNULL(hours, 0) < 0.25)")
     db.commit()
 FACTORY_SAMPLE_RE = re.compile(r'\\image-line\\fl studio[^\\]*\\data\\patches\\', re.I)
 
 
+_DOCS = None
+
+
+def documents_dir():
+    """The user's Documents folder as Windows knows it (OneDrive may have moved it)."""
+    global _DOCS
+    if _DOCS is None:
+        _DOCS = os.path.join(os.path.expanduser('~'), 'Documents')
+        try:
+            import ctypes
+            from ctypes import wintypes
+            buf = ctypes.c_wchar_p()
+            fid = (ctypes.c_byte * 16).from_buffer_copy(bytes.fromhex('5e6c858ee5ad4d418dc0c3a81a7b0ee1'))  # FOLDERID_Documents
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(fid), 0, None, ctypes.byref(buf)) == 0 and buf.value:
+                _DOCS = buf.value
+                ctypes.windll.ole32.CoTaskMemFree(buf)
+        except Exception:  # noqa: BLE001 - not Windows, or shell32 unhappy: the default stands
+            pass
+    return _DOCS
+
+
+def fl_user_dir(cfg=None):
+    """Documents\\Image-Line (FL's user data root), or `fl_user_data` from config.json."""
+    cfg = cfg if cfg is not None else _CFG_CACHE
+    custom = (cfg or {}).get('fl_user_data')
+    if custom and os.path.isdir(custom):
+        return custom
+    return os.path.join(documents_dir(), 'Image-Line')
+
+
+_CFG_CACHE = None
+
+
 def load_config():
+    global _CFG_CACHE
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, encoding='utf-8-sig') as f:  # -sig: PowerShell likes to add a BOM
@@ -156,6 +203,7 @@ def load_config():
     else:
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=2)
+    _CFG_CACHE = cfg
     return cfg
 
 
@@ -269,10 +317,16 @@ def fl_own_plugin(path):
     return '\\image-line\\' in low or '\\plugins\\fruity\\' in low or ntpath.basename(low).startswith('fruity ')
 
 
+_FL_KNOWN = None
+
+
 def fl_known_plugins():
     """Plugin DLL paths FL's own plugin database lists as installed on this PC (lower-case)."""
+    global _FL_KNOWN
     paths = set()
-    base = os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Presets', 'Plugin database', 'Installed')
+    if _FL_KNOWN is not None:
+        return _FL_KNOWN
+    base = os.path.join(fl_user_dir(), 'FL Studio', 'Presets', 'Plugin database', 'Installed')
     for root, _dirs, files in os.walk(base):
         for f in files:
             if f.lower().endswith('.nfo') or f.lower() == '.plugins.ini':  # FL 20+ keeps one .Plugins.ini
@@ -286,6 +340,7 @@ def fl_known_plugins():
                                 paths.add(p)
                 except OSError:
                     pass
+    _FL_KNOWN = paths
     return paths
 
 
@@ -461,7 +516,12 @@ class AudioIndex:
                     break
                 s += 1
             return s
-        return max(hits, key=lambda h: (score(h), not h.startswith('\\\\')))
+        top = max(hits, key=lambda h: (score(h), not h.startswith('\\\\')))
+        # a copy in a folder named like the original is a move; a lone same-named file on the
+        # drives probably is too; the fourth "Kick.wav" of a random pack is not
+        if score(top) >= 1 or len(hits) == 1:
+            return top
+        return None
 
 
 # ---------- naming ----------
@@ -470,7 +530,7 @@ def song_identity(directory, name):
     stem = name[:-4] if name.lower().endswith('.flp') else name
     autosave = bool(AUTOSAVE_RE.search(stem)) or ntpath.basename(directory).lower() == 'backup'
     stem = AUTOSAVE_RE.sub('', stem)
-    base = VERSION_SUFFIX_RE.sub('', stem).strip(' _-.')
+    base = VERSION_SUFFIX_RE.sub('', stem).strip(' _-.') or stem.strip(' _-.')
     parts = [p for p in directory.split('\\') if p]
     while len(parts) > 1 and parts[-1].lower() in GENERIC_DIRS:
         parts.pop()
@@ -482,7 +542,15 @@ def song_identity(directory, name):
 def expand_sample(sp):
     low = sp.lower()
     if low.startswith('%flstudiouserdata%'):
-        return os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line') + sp[len('%flstudiouserdata%'):]
+        return fl_user_dir() + sp[len('%flstudiouserdata%'):]
+    if low.startswith(('%flstudiofactorydata%', '%flstudiodata%')):
+        # FL's own content: whichever installed FL has it
+        rest = sp.split('%', 2)[2]
+        for d in fl_patches_dirs():  # <FL>\Data\Patches
+            for root in (os.path.dirname(os.path.dirname(d)), os.path.dirname(d)):
+                cand = os.path.join(root, rest.lstrip('\\'))
+                if os.path.exists(cand):
+                    return cand
     return os.path.expandvars(sp)
 
 
@@ -501,7 +569,7 @@ def fl_user_audio_candidates(sp):
     if not m:
         return []
     sub, rest = FL_USER_AUDIO[m.group(1).lower()], sp[m.end():]
-    out = [os.path.join(os.path.expanduser('~'), 'Documents', 'Image-Line', 'FL Studio', 'Audio', sub, rest)]
+    out = [os.path.join(fl_user_dir(), 'FL Studio', 'Audio', sub, rest)]
     for d in fl_patches_dirs():
         out.append(os.path.join(d, m.group(1), rest))
     return out
@@ -580,6 +648,10 @@ def quick_hash(buf):
 def work_flp(path):
     try:
         with open(path, 'rb') as f:
+            if path.startswith('\\\\'):
+                # a share that drops mid-read kills a memory-mapped worker outright; a read fails softly
+                data = f.read()
+                return path, quick_hash(data), flparse.parse_buffer(data), None
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             try:
                 return path, quick_hash(mm), flparse.parse_buffer(mm), None
@@ -589,17 +661,109 @@ def work_flp(path):
         return path, None, None, f'{type(e).__name__}: {e}'
 
 
+# Zip member names: FL writes them in the OEM code page of the PC that saved the zip (cp862 on a
+# Hebrew Windows, cp866 on a Russian one...) without the UTF-8 flag, and Python versions disagree
+# on how to decode that. Read every name as cp437 (the raw bytes, one per char) and map it to a
+# readable name ourselves, the same way on every PC.
+_OEM_BY_LANG = {0x0d: 'cp862', 0x19: 'cp866', 0x22: 'cp866', 0x23: 'cp866', 0x02: 'cp866', 0x2f: 'cp866',
+                0x08: 'cp737', 0x1f: 'cp857', 0x15: 'cp852', 0x05: 'cp852', 0x1b: 'cp852', 0x0e: 'cp852',
+                0x1a: 'cp852', 0x24: 'cp852', 0x18: 'cp852', 0x25: 'cp775', 0x26: 'cp775', 0x27: 'cp775',
+                0x01: 'cp720', 0x1e: 'cp874', 0x11: 'cp932', 0x12: 'cp949', 0x04: 'cp936'}
+_ZIP_CPS = None
+
+
+def zip_code_pages():
+    """Code pages member names may be in, most likely first."""
+    global _ZIP_CPS
+    if _ZIP_CPS is None:
+        cfg = _CFG_CACHE or {}
+        forced = (cfg.get('zip_encoding') or 'auto').lower()
+        cps = []
+        if forced != 'auto':
+            cps.append(forced)
+        try:
+            import ctypes
+            n = ctypes.windll.user32.GetKeyboardLayoutList(0, None)
+            arr = (ctypes.c_void_p * max(n, 1))()
+            n = ctypes.windll.user32.GetKeyboardLayoutList(n, arr)
+            for h in arr[:n]:
+                cp = _OEM_BY_LANG.get((h or 0) & 0x3ff)
+                if cp and cp not in cps:
+                    cps.append(cp)
+        except Exception:  # noqa: BLE001
+            pass
+        for cp in ('oem', 'mbcs'):
+            if cp not in cps:
+                cps.append(cp)
+        _ZIP_CPS = cps
+    return _ZIP_CPS
+
+
+_HEBREW = re.compile('[\u0590-\u05ff]')
+_CYRILLIC = re.compile('[\u0400-\u04ff]')
+_GREEK = re.compile('[\u0370-\u03ff]')
+
+
+def zip_member_name(raw, zpath=''):
+    """Readable name for a member name read as cp437. Names that are plain ASCII come back as is."""
+    try:
+        b = raw.encode('cp437')
+    except UnicodeEncodeError:
+        return raw  # already decoded as UTF-8 (the flag was set)
+    if b.isascii():
+        return raw
+    cps = list(zip_code_pages())
+    # the zip's own name or folder says which script to expect
+    for rx, cp in ((_HEBREW, 'cp862'), (_CYRILLIC, 'cp866'), (_GREEK, 'cp737')):
+        if rx.search(zpath):
+            cps.insert(0, cp)
+    for cp in cps:
+        try:
+            out = b.decode(cp)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if cp == 'cp437' or all(ch.isalnum() or ch.isspace() for ch, byte in zip(out, b) if byte >= 0x80):
+            return out
+    return raw
+
+
+def open_zip(zpath):
+    return zipfile.ZipFile(zpath, metadata_encoding='cp437')
+
+
+def zip_real_name(z, member, zpath=''):
+    """The name inside the zip for a member stored under its readable name (or an old cp437 one)."""
+    names = z.namelist()
+    if member in names:
+        return member
+    for n in names:
+        if zip_member_name(n, zpath) == member:
+            return n
+    raise KeyError(f'no {member!r} in the zip')
+
+
+def zip_flp_members(z, zpath=''):
+    """Readable names of the project files in an FL zip (Mac resource forks skipped)."""
+    out = []
+    for n in z.namelist():
+        base = n.replace('\\', '/').rsplit('/', 1)[-1]
+        if n.lower().endswith('.flp') and not base.startswith('._') and not n.startswith('__MACOSX/'):
+            out.append(zip_member_name(n, zpath))
+    return out
+
+
 def work_zip(args):
     zpath, members = args
     out = []
     try:
-        with zipfile.ZipFile(zpath) as z:
-            names = sorted({ntpath.basename(n.replace('/', '\\')).lower() for n in z.namelist()})
+        with open_zip(zpath) as z:
+            names = sorted({ntpath.basename(zip_member_name(n, zpath).replace('/', '\\')).lower() for n in z.namelist()})
             for m in members:
                 try:
-                    if z.getinfo(m).file_size > MAX_ZIP_MEMBER:
+                    real = zip_real_name(z, m, zpath)
+                    if z.getinfo(real).file_size > MAX_ZIP_MEMBER:
                         raise flparse.FLPError('flp inside zip too large')
-                    data = z.read(m)
+                    data = z.read(real)
                     out.append((m, quick_hash(data), flparse.parse_buffer(data), None))
                 except Exception as e:  # noqa: BLE001
                     out.append((m, None, None, f'{type(e).__name__}: {e}'))
@@ -610,8 +774,8 @@ def work_zip(args):
 
 def peek_zip(path):
     try:
-        with zipfile.ZipFile(path) as z:
-            return path, [n for n in z.namelist() if n.lower().endswith('.flp')][:MAX_FLPS_PER_ZIP]
+        with open_zip(path) as z:
+            return path, zip_flp_members(z, path)[:MAX_FLPS_PER_ZIP]
     except Exception:  # noqa: BLE001 - not a readable zip
         return path, []
 
@@ -619,6 +783,12 @@ def peek_zip(path):
 def store(db, audio, path, container, kind, directory, name, size, mtime, h, info, err, zip_names):
     key, sname, autosave = song_identity(directory, name)
     if err or not info:
+        old = db.execute('SELECT hash FROM files WHERE path = ?', (path,)).fetchone()
+        if old and old[0] and not old[0].startswith('err:') and db.execute(
+                'SELECT 1 FROM projects WHERE hash = ? AND error IS NULL', (old[0],)).fetchone():
+            # read before and fine: a share hiccup or FL mid-save; keep the good row, retry next scan
+            db.execute('UPDATE files SET size = -1 WHERE path = ?', (path,))
+            return
         h = 'err:' + hashlib.sha1(path.encode('utf-8', 'replace')).hexdigest()
         db.execute('INSERT OR REPLACE INTO projects(hash, error) VALUES(?,?)', (h, err or 'unknown'))
     elif audio is None and (row := db.execute('SELECT plugins FROM projects WHERE hash = ?', (h,)).fetchone()):
@@ -660,18 +830,33 @@ def run_pool(db, fn, items, path_of, on_result, label, progress, stall=90):
     workers = max(2, min(8, (os.cpu_count() or 4) - 1))
     total, done_n = len(items), 0
     last_commit = time.time()
+    broken = 0
     while items:
         pool = ProcessPoolExecutor(workers)
         futs = {pool.submit(fn, it): it for it in items}
         waiting = set(futs)
         stalled = False
         while waiting:
-            done, waiting = wait(waiting, timeout=stall, return_when=FIRST_COMPLETED)
+            try:
+                done, waiting = wait(waiting, timeout=stall, return_when=FIRST_COMPLETED)
+                results = [(futs[f], f.result()) for f in done]
+            except BrokenProcessPool:
+                broken += 1
+                left = [futs[f] for f in waiting if not f.done()]
+                pool.shutdown(wait=False, cancel_futures=True)
+                if broken > 3 or not left:
+                    progress(f'{label}: a worker died {broken} times; {len(left):,} files left for the next scan')
+                    db.commit()
+                    return
+                progress(f'{label}: a worker died, restarting the rest ({len(left):,} files)')
+                items = left
+                stalled = None
+                break
             if not done:
                 stalled = True
                 break
-            for f in done:
-                on_result(futs[f], f.result())
+            for it, res in results:
+                on_result(it, res)
                 done_n += 1
                 if done_n % 500 == 0:
                     progress(f'{label}: {done_n:,}/{total:,}')
@@ -679,6 +864,8 @@ def run_pool(db, fn, items, path_of, on_result, label, progress, stall=90):
                 db.commit()
                 last_commit = time.time()
         db.commit()
+        if stalled is None:
+            continue
         if not stalled:
             pool.shutdown()
             break
@@ -716,17 +903,25 @@ def scan(recheck=False):
     def progress(msg):
         print(msg, flush=True)
         db.execute("INSERT OR REPLACE INTO state VALUES('progress', ?)", (msg,))
+        db.execute("INSERT OR REPLACE INTO state VALUES('heartbeat', ?)", (str(int(time.time())),))
         db.commit()
 
     st = dict(db.execute('SELECT k, v FROM state'))
-    if st.get('scanning') == '1' and time.time() - int(st.get('scan_started') or 0) < 7200:
+    beat = int(st.get('heartbeat') or st.get('scan_started') or 0)
+    if st.get('scanning') == '1' and time.time() - beat < 600:
         print('another scan is running')
         return
     db.execute("INSERT OR REPLACE INTO state VALUES('scanning', '1')")
     db.execute("INSERT OR REPLACE INTO state VALUES('scan_started', ?)", (str(int(time.time())),))
     progress('querying Everything...')
-    flps = candidates(cfg, 'file: ext:flp', wanted)
-    zips = candidates(cfg, 'file: ext:zip', wanted)
+    try:
+        flps = candidates(cfg, 'file: ext:flp', wanted)
+        zips = candidates(cfg, 'file: ext:zip', wanted)
+    except (OSError, ValueError) as e:
+        progress(f'Everything is not answering at {cfg["everything_url"]} ({e}); nothing scanned')
+        db.execute("INSERT OR REPLACE INTO state VALUES('scanning', '0')")
+        db.commit()
+        return
 
     roots = {root_of(p) for p in list(flps) + list(zips)}
     live = {r for r in roots if reachable(r)}
@@ -737,7 +932,13 @@ def scan(recheck=False):
     progress(f'{len(flps):,} flp, {len(zips):,} zip candidates')
 
     # which zips hold projects (cached per size+mtime)
+    if st.get('zip_names') != '2':
+        # member names stored by an older scanner may be mis-decoded: look at the non-ASCII ones again
+        db.execute("DELETE FROM zipcache WHERE members GLOB '*[^ -~]*'")
+        db.execute("INSERT OR REPLACE INTO state VALUES('zip_names', '2')")
+        db.commit()
     cache = {r[0]: r[1:] for r in db.execute('SELECT path, size, mtime, members FROM zipcache')}
+    db.execute('DELETE FROM zipcache WHERE path NOT IN (SELECT path FROM files WHERE container IS NOT NULL UNION SELECT ?)', ('',))
     to_peek = [p for p, (s, m) in zips.items() if p not in cache or cache[p][:2] != (s, m)]
     if to_peek:
         with ThreadPoolExecutor(8) as ex:
@@ -747,6 +948,8 @@ def scan(recheck=False):
                 db.execute('INSERT OR REPLACE INTO zipcache VALUES(?,?,?,?)', (p, s, m, cache[p][2]))
                 if i % 2000 == 0:
                     progress(f'checking zips: {i:,}/{len(to_peek):,}')
+                elif i % 50 == 0:
+                    db.commit()  # short transactions: the panel writes too
         db.commit()
     zip_members = {}
     for p in zips:
@@ -763,6 +966,11 @@ def scan(recheck=False):
                                        'WHERE p.samples LIKE \'%"status": "factory"%\' AND ('
                                        'p.samples LIKE \'%\\\\Rendered\\\\%\' OR p.samples LIKE \'%\\\\Recorded\\\\%\' '
                                        'OR p.samples LIKE \'%\\\\Sliced beats\\\\%\' OR p.samples LIKE \'%\\\\Sliced audio\\\\%\')')}
+    # files that failed last time are tried again (a share hiccup, FL mid-save); files that are
+    # simply not FL projects (VMware floppy images are .flp too) are left alone until they change
+    stale |= {r[0] for r in db.execute(
+        "SELECT f.path FROM files f JOIN projects p ON p.hash = f.hash WHERE p.error IS NOT NULL "
+        "AND p.error NOT LIKE 'FLPError: not an FLP%' AND p.error NOT LIKE 'BadZipFile%' AND p.error NOT LIKE '%too large%'")}
     new_flps = [p for p, v in flps.items() if recheck or known.get(p) != v or p in stale]
     new_flps.sort(key=lambda p: p.startswith('\\\\'))  # local drives first, slow shares last
     new_zips = []
@@ -826,6 +1034,8 @@ def scan(recheck=False):
 
 
 if __name__ == '__main__':
+    if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(errors='replace')
     try:
         scan(recheck='--recheck' in sys.argv)
     except Exception:

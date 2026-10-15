@@ -13,6 +13,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use windows::core::*;
@@ -20,6 +22,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IServiceProvider, CLSCTX_LOCAL_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Ole::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::{InitCommonControlsEx, SetWindowTheme, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX};
@@ -102,6 +105,8 @@ const LVNI_SELECTED: isize = 2;
 const SEARCH_TIMER: usize = 1;
 const SELECT_TIMER: usize = 2;
 const WM_SEARCH_DONE: u32 = WM_APP + 10;
+static SEARCH_GEN: AtomicU64 = AtomicU64::new(0); // process-wide: panels come and go, handles get reused
+static FETCH_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 // window styles / messages not worth a typed import
 const BS_OWNERDRAW: u32 = 0x000B;
@@ -894,8 +899,40 @@ fn set_hide_demos(on: bool) {
 
 // ---------- Everything search ----------
 
+/// config.json next to the library (what the scanner uses), or Null.
+fn config() -> &'static serde_json::Value {
+    static CFG: OnceLock<serde_json::Value> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let path = crate::db_file().map(|db| std::path::Path::new(&db).with_file_name("config.json"));
+        path.and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null)
+    })
+}
+
+/// host:port of Everything's HTTP server: config.json's everything_url, else what the installer stored.
+fn everything_addr() -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    if let Some(url) = config()["everything_url"].as_str() {
+        let host = url.trim_start_matches("http://").trim_start_matches("https://").split('/').next().unwrap_or("");
+        let host = if host.contains(':') { host.to_string() } else { format!("{host}:80") };
+        if let Some(a) = host.to_socket_addrs().ok().and_then(|mut i| i.next()) {
+            return Some(a);
+        }
+    }
+    reg_str(w!("Everything"))?.parse().ok()
+}
+
+fn search_exclude() -> String {
+    if let Some(list) = config()["exclude_prefixes"].as_array() {
+        let parts: Vec<String> = list.iter().filter_map(|v| v.as_str()).map(|p| format!("!\"{p}\"")).collect();
+        if !parts.is_empty() {
+            return parts.join(" ");
+        }
+    }
+    reg_str(w!("SearchExclude")).unwrap_or_default()
+}
+
 fn everything(search: &str) -> Option<serde_json::Value> {
-    let addr: SocketAddr = reg_str(w!("Everything"))?.parse().ok()?;
+    let addr: SocketAddr = everything_addr()?;
     let mut encoded = String::new();
     for b in search.bytes() {
         if b.is_ascii_alphanumeric() {
@@ -920,7 +957,9 @@ fn everything(search: &str) -> Option<serde_json::Value> {
 
 /// Projects on any drive whose name matches `text`, newest first, with what the library knows.
 fn search(text: &str) -> (String, Vec<Row>) {
-    let exclude = reg_str(w!("SearchExclude")).unwrap_or_default();
+    let exclude = search_exclude();
+    let text = text.replace('"', " "); // an unbalanced quote makes Everything return nothing
+    let text = text.trim();
     let Some(json) = everything(&format!("file: ext:flp;zip {text} !\"(autosaved\" !\"(overwritten\" {exclude}")) else {
         return ("Everything is not answering".into(), Vec::new());
     };
@@ -1039,6 +1078,8 @@ unsafe fn go_to(hwnd: HWND, s: &mut Song, target: &str) {
     ILFree(Some(folder as *const _));
     if went {
         s.pending = Some((target.to_string(), 0));
+        // the host rebuilds the panel when Explorer's folder changes; hold it until the file is selected
+        let _ = SetPropW(GetAncestor(hwnd, GA_PARENT), w!("FLLibraryPending"), HANDLE(GetTickCount() as usize as *mut c_void));
         SetTimer(hwnd, SELECT_TIMER, 250, None);
     } else {
         reveal(target); // not attached to an Explorer window: open a new one
@@ -1070,6 +1111,7 @@ unsafe fn select_pending(hwnd: HWND, s: &mut Song) {
     }
     if done {
         let _ = KillTimer(hwnd, SELECT_TIMER);
+        let _ = RemovePropW(GetAncestor(hwnd, GA_PARENT), w!("FLLibraryPending"));
     } else {
         s.pending = Some((target, tries + 1));
     }
@@ -1472,7 +1514,7 @@ unsafe fn show_results(hwnd: HWND, s: &mut Song) {
     if !text.is_empty() {
         // Everything + per-hit library lookups can take seconds: run them on a worker thread
         s.mode = Mode::Search;
-        s.search_gen += 1;
+        s.search_gen = SEARCH_GEN.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         let (gen, target) = (s.search_gen, hwnd.0 as isize);
         std::thread::spawn(move || {
             let found = Box::into_raw(Box::new((gen, search(&text))));
@@ -1640,7 +1682,8 @@ unsafe fn layout(hwnd: HWND, s: &Song) {
 
 unsafe fn text_of(hwnd: HWND, id: i32) -> String {
     let Ok(c) = GetDlgItem(hwnd, id) else { return String::new() };
-    let mut buf = vec![0u16; 8192];
+    let len = GetWindowTextLengthW(c).max(0) as usize + 1;
+    let mut buf = vec![0u16; len.max(2)];
     let n = GetWindowTextW(c, &mut buf).max(0) as usize;
     String::from_utf16_lossy(&buf[..n])
 }
@@ -1923,16 +1966,19 @@ pub unsafe fn create(parent: HWND, rc: RECT, path: &str) -> HWND {
     let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES };
     let _ = InitCommonControlsEx(&icc);
     let class = w!("FLLibraryPanel");
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(wndproc),
-        hInstance: hinst,
-        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-        hbrBackground: CreateSolidBrush(COLORREF(C_BG)),
-        lpszClassName: class,
-        ..Default::default()
-    };
-    RegisterClassExW(&wc); // fails harmlessly when already registered
+    static REG: std::sync::Once = std::sync::Once::new();
+    REG.call_once(|| {
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: CreateSolidBrush(COLORREF(C_BG)),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+    });
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_CONTROLPARENT,
         class,
@@ -2001,6 +2047,7 @@ struct FetchWin {
     rows: Vec<FetchRow>,
     phase: FetchPhase,
     done: bool,
+    token: u64, // stamped on every helper event: an old helper's events never reach a newer window
 }
 
 unsafe fn lv_set_checked(lv: HWND, item: usize, checked: bool) {
@@ -2191,6 +2238,9 @@ unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
         return;
     }
     let i = i as usize;
+    if st.phase != FetchPhase::Ready {
+        return;
+    }
     let Some(row) = st.rows.get(i) else { return };
     let Ok(menu) = CreatePopupMenu() else { return };
     if row.sources.is_empty() {
@@ -2208,7 +2258,7 @@ unsafe fn fetch_pick_source(hwnd: HWND, st: &mut FetchWin) {
     let _ = SetForegroundWindow(hwnd);
     let pick = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None).0 as usize;
     let _ = DestroyMenu(menu);
-    if pick == 0 || st.phase == FetchPhase::Copying {
+    if pick == 0 || st.phase != FetchPhase::Ready || pick > st.rows.get(i).map(|r| r.sources.len()).unwrap_or(0) {
         return;
     }
     st.rows[i].chosen = pick - 1;
@@ -2247,9 +2297,13 @@ unsafe fn spawn_flctl_events(hwnd: HWND, args: &[&str]) -> bool {
     };
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else { return false };
     let target = hwnd.0 as isize;
+    let token = {
+        let st = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FetchWin;
+        if st.is_null() { 0 } else { (*st).token }
+    };
     let post = move |v: serde_json::Value| -> bool {
         let b = Box::into_raw(Box::new(v));
-        if PostMessageW(HWND(target as *mut c_void), WM_FETCH_EVENT, WPARAM(0), LPARAM(b as isize)).is_err() {
+        if PostMessageW(HWND(target as *mut c_void), WM_FETCH_EVENT, WPARAM(token as usize), LPARAM(b as isize)).is_err() {
             drop(Box::from_raw(b));
             return false;
         }
@@ -2287,7 +2341,7 @@ unsafe extern "system" fn fetch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     match msg {
         WM_FETCH_EVENT if lp.0 != 0 => {
             let ev = Box::from_raw(lp.0 as *mut serde_json::Value);
-            if !st.is_null() {
+            if !st.is_null() && (*st).token == wp.0 as u64 {
                 let _ = catch_unwind(AssertUnwindSafe(|| fetch_event(hwnd, &mut *st, &ev)));
             }
             LRESULT(0)
@@ -2353,16 +2407,19 @@ unsafe extern "system" fn fetch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32, kind: &'static str) {
     let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
     let class = w!("FLLibraryFetch");
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(fetch_proc),
-        hInstance: hinst,
-        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-        hbrBackground: CreateSolidBrush(COLORREF(C_BG)),
-        lpszClassName: class,
-        ..Default::default()
-    };
-    RegisterClassExW(&wc);
+    static REG: std::sync::Once = std::sync::Once::new();
+    REG.call_once(|| {
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(fetch_proc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: CreateSolidBrush(COLORREF(C_BG)),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+    });
     let px = |v: i32| v * dpi / 96;
     let (w, h) = (px(900), px(460));
     let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
@@ -2395,6 +2452,7 @@ pub unsafe fn open_fetch_window(flp: &str, plugins: &[String], dpi: i32, kind: &
     let bold = CreateFontW(-px(13), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
     let st = Box::into_raw(Box::new(FetchWin {
         font, bold, brush_bg: CreateSolidBrush(COLORREF(C_BG)), dpi, flp: flp.to_string(), kind, rows: Vec::new(), phase: FetchPhase::Searching, done: false,
+        token: FETCH_TOKEN.fetch_add(1, AtomicOrdering::Relaxed) + 1,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, st as isize);
     child(hwnd, w!("STATIC"), &format!("Looking for the missing {kind}\u{2026}"), SS_NOPREFIX, 0, ID_FETCH_SUMMARY, bold);

@@ -3,7 +3,10 @@
 //! nothing is selected. Turn the pane on/off with Alt+P as usual.
 #![windows_subsystem = "windows"]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use flprops::{panel, query};
 use windows::core::*;
@@ -12,6 +15,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Registry::*;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -37,8 +41,9 @@ struct State {
     content: Option<String>, // path the panel currently shows
     child: HWND,
     rect: RECT,
-    checked: (String, bool), // last folder tested for projects
-    zip_checked: (String, bool), // last zip tested for a project inside
+    cache: HashMap<String, (Instant, bool)>, // folder-has-projects / zip-is-FL / is-dir answers, 20 s
+    last_scan: String,       // the library's last_scan stamp: a finished scan refreshes the panel
+    db_poll: Instant,
     enabled: bool,           // tray toggle; remembered in HKCU\Software\FLLibrary\Enabled
     taskbar_created: u32,    // Explorer restarted: the tray icon must be added again
 }
@@ -127,29 +132,41 @@ unsafe fn pane_rect(target: HWND) -> Option<RECT> {
     (rc.right - rc.left >= MIN_PANE * GetDpiForWindow(target).max(96) as i32 / 96 && rc.bottom > rc.top).then_some(rc)
 }
 
+/// Answers that cost a database query or a disk access, kept for a while: the tick asks every
+/// 300 ms, and a folder on a PC that is off would otherwise stall the panel on every tick.
+fn cached(st: &mut State, key: String, compute: impl FnOnce() -> bool) -> bool {
+    if let Some((when, v)) = st.cache.get(&key) {
+        if when.elapsed() < Duration::from_secs(20) {
+            return *v;
+        }
+    }
+    if st.cache.len() > 200 {
+        st.cache.clear();
+    }
+    let v = compute();
+    st.cache.insert(key, (Instant::now(), v));
+    v
+}
+
 fn has_projects(st: &mut State, dir: &str) -> bool {
     if dir.is_empty() {
         return false;
     }
-    if st.checked.0 != dir {
-        let found = !query(
+    let d = dir.trim_end_matches('\\').to_string();
+    cached(st, format!("dir:{}", d.to_lowercase()), || {
+        !query(
             "SELECT 1 FROM files WHERE is_autosave = 0 AND (dir = ?1 COLLATE NOCASE \
              OR substr(dir, 1, length(?1) + 1) = ?1 || char(92) COLLATE NOCASE) LIMIT 1",
-            dir.trim_end_matches('\\'),
+            &d,
         )
-        .is_empty();
-        st.checked = (dir.to_string(), found);
-    }
-    st.checked.1
+        .is_empty()
+    })
 }
 
 /// A zip the library found an FL project in (zipped projects are indexed like loose .flp files).
 fn is_fl_zip(st: &mut State, zip: &str) -> bool {
-    if st.zip_checked.0 != zip {
-        let found = !query("SELECT 1 FROM files WHERE container = ?1 COLLATE NOCASE LIMIT 1", zip).is_empty();
-        st.zip_checked = (zip.to_string(), found);
-    }
-    st.zip_checked.1
+    let z = zip.to_string();
+    cached(st, format!("zip:{}", z.to_lowercase()), || !query("SELECT 1 FROM files WHERE container = ?1 COLLATE NOCASE LIMIT 1", &z).is_empty())
 }
 
 /// What the panel should show for this Explorer view; None hides it (normal preview shows).
@@ -159,7 +176,8 @@ fn wanted(st: &mut State, v: &View) -> Option<String> {
         if low.ends_with(".flp") || (low.ends_with(".zip") && is_fl_zip(st, sel)) {
             return Some(sel.clone());
         }
-        let is_dir = std::fs::metadata(sel).map(|m| m.is_dir()).unwrap_or(false);
+        let s = sel.clone();
+        let is_dir = cached(st, format!("isdir:{low}"), || std::fs::metadata(&s).map(|m| m.is_dir()).unwrap_or(false));
         if is_dir && has_projects(st, sel) {
             return Some(sel.clone());
         }
@@ -211,15 +229,36 @@ unsafe fn tick(host: HWND, st: &mut State) {
     }
     let Some(rc) = pane_rect(st.target) else { return hide(st) };
     if st.browser.is_none() {
+        if st.shell.Count().is_err() {
+            // Explorer was restarted: the old ShellWindows proxy answers nothing any more
+            if let Ok(sh) = CoCreateInstance::<_, IShellWindows>(&ShellWindows, None, CLSCTX_LOCAL_SERVER) {
+                st.shell = sh;
+            }
+        }
         st.browser = find_browser(&st.shell, st.target);
+    }
+    // a scan just finished: what the panel shows may be out of date
+    if st.db_poll.elapsed() >= Duration::from_secs(5) {
+        st.db_poll = Instant::now();
+        let stamp = query("SELECT v FROM state WHERE k = ?1", "last_scan").into_iter().flatten().next().unwrap_or_default();
+        if stamp != st.last_scan {
+            if !st.last_scan.is_empty() && fg != host {
+                st.content = None;
+                st.cache.clear();
+            }
+            st.last_scan = stamp;
+        }
     }
     let view = st.browser.as_ref().and_then(|b| view_of(b));
     let Some(view) = view else {
         st.browser = None; // window navigated / closed: look it up again next tick
         return hide(st);
     };
-    // keep whatever is shown while the user is working inside the panel (typing a search...)
-    let content = if fg == host && st.content.is_some() { st.content.clone() } else { wanted(st, &view) };
+    // keep whatever is shown while the user is working inside the panel (typing a search...), and
+    // while the panel is steering Explorer to a file (Ctrl+double-click) and waits to select it
+    let pending = GetPropW(host, w!("FLLibraryPending")).0 as usize as u32;
+    let steering = pending != 0 && GetTickCount().wrapping_sub(pending) < 6000;
+    let content = if (fg == host || steering) && st.content.is_some() { st.content.clone() } else { wanted(st, &view) };
     let Some(path) = content else { return hide(st) };
     let _ = view.count;
 
@@ -294,14 +333,19 @@ fn write_enabled(on: bool) {
 
 /// Icons ship next to the exe: fl_on.ico / fl_off.ico.
 unsafe fn tray_icon(on: bool) -> HICON {
-    let mut exe = [0u16; 1024];
-    let n = GetModuleFileNameW(None, &mut exe) as usize;
-    let exe = String::from_utf16_lossy(&exe[..n]);
-    let dir = exe.rsplit_once('\\').map(|(d, _)| d).unwrap_or(".");
-    let file = HSTRING::from(format!("{dir}\\{}", if on { "fl_on.ico" } else { "fl_off.ico" }));
-    LoadImageW(None, &file, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
-        .map(|h| HICON(h.0))
-        .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default())
+    static ICONS: OnceLock<(isize, isize)> = OnceLock::new();
+    let load = |name: &str| -> isize {
+        let mut exe = [0u16; 1024];
+        let n = GetModuleFileNameW(None, &mut exe) as usize;
+        let exe = String::from_utf16_lossy(&exe[..n]);
+        let dir = exe.rsplit_once('\\').map(|(d, _)| d).unwrap_or(".");
+        let file = HSTRING::from(format!("{dir}\\{name}"));
+        LoadImageW(None, &file, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            .map(|h| h.0 as isize)
+            .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).map(|h| h.0 as isize).unwrap_or(0))
+    };
+    let (a, b) = *ICONS.get_or_init(|| (load("fl_on.ico"), load("fl_off.ico")));
+    HICON((if on { a } else { b }) as *mut c_void)
 }
 
 unsafe fn tray(host: HWND, on: bool, op: NOTIFY_ICON_MESSAGE) {
@@ -342,8 +386,10 @@ unsafe fn tray_menu(host: HWND, st: &mut State) {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(host); // so the menu closes when you click elsewhere
+    let _ = KillTimer(host, TICK); // the menu pumps messages: no tick() under our feet
     let pick = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, host, None);
     let _ = DestroyMenu(menu);
+    SetTimer(host, TICK, TICK_MS, None);
     match pick.0 as usize {
         MENU_TOGGLE => set_enabled(host, st, !st.enabled),
         MENU_UPDATE => panel::flctl(&["update"]),
@@ -434,8 +480,9 @@ fn main() -> Result<()> {
             content: None,
             child: HWND::default(),
             rect: RECT::default(),
-            checked: (String::new(), false),
-            zip_checked: (String::new(), false),
+            cache: HashMap::new(),
+            last_scan: String::new(),
+            db_poll: Instant::now(),
             enabled: read_enabled(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });
