@@ -932,13 +932,17 @@ def scan(recheck=False):
     progress(f'{len(flps):,} flp, {len(zips):,} zip candidates')
 
     # which zips hold projects (cached per size+mtime)
-    if st.get('zip_names') != '2':
-        # member names stored by an older scanner may be mis-decoded: look at the non-ASCII ones again
-        db.execute("DELETE FROM zipcache WHERE members GLOB '*[^ -~]*'")
-        db.execute("INSERT OR REPLACE INTO state VALUES('zip_names', '2')")
+    if st.get('zip_names') != '3':
+        # member names stored by an older scanner may be mis-decoded: look at the non-ASCII ones
+        # again (json.dumps stores them as \\uXXXX escapes)
+        db.execute("DELETE FROM zipcache WHERE instr(members, '\\u') > 0")
+        db.execute("INSERT OR REPLACE INTO state VALUES('zip_names', '3')")
         db.commit()
     cache = {r[0]: r[1:] for r in db.execute('SELECT path, size, mtime, members FROM zipcache')}
-    db.execute('DELETE FROM zipcache WHERE path NOT IN (SELECT path FROM files WHERE container IS NOT NULL UNION SELECT ?)', ('',))
+    # zips that are gone (or on a share that is off this time are kept: their answer still holds)
+    for stale_zip in [c for c in cache if c not in zips and root_of(c) in live]:
+        del cache[stale_zip]
+        db.execute('DELETE FROM zipcache WHERE path = ?', (stale_zip,))
     to_peek = [p for p, (s, m) in zips.items() if p not in cache or cache[p][:2] != (s, m)]
     if to_peek:
         with ThreadPoolExecutor(8) as ex:
